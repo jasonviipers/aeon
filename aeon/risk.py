@@ -2,6 +2,7 @@
 argue for anything it likes but cannot exceed these limits."""
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -42,6 +43,11 @@ class Verdict:
 
 def _reject(why: str) -> Verdict:
     return Verdict(ok=False, why=why)
+
+
+def _not_finite(*values: float | None) -> bool:
+    """NaN fails every comparison, so a NaN stop would slip past 'wrong side' and 'too far' checks."""
+    return any(v is not None and not math.isfinite(v) for v in values)
 
 
 class RiskEngine:
@@ -206,6 +212,12 @@ class RiskEngine:
         c = self.cfg
         long = prop.side == "long"
         sl, tp = prop.stop_loss, prop.take_profit
+        if _not_finite(price, sl, tp, prop.margin_pct, prop.leverage) or not price or price <= 0:
+            return _reject("a price, stop, target, margin or leverage value is not a usable number")
+        if not math.isfinite(acct.equity) or acct.equity <= 0:
+            return _reject("account equity is unavailable")
+        if prop.margin_pct is not None and prop.margin_pct <= 0:
+            return _reject("margin_pct must be a positive percentage of equity")
         if not sl or sl <= 0:
             return _reject("a stop_loss is required on every position")
         if (long and sl >= price) or (not long and sl <= price):
@@ -271,6 +283,8 @@ class RiskEngine:
         c = self.cfg
         if not pos:
             return _reject("no open position to adjust")
+        if _not_finite(price, prop.stop_loss, prop.take_profit) or not price or price <= 0:
+            return _reject("a price, stop or target value is not a usable number")
         long = pos.side == "long"
         sl = prop.stop_loss if prop.stop_loss else pos.sl
         tp = prop.take_profit if prop.take_profit else pos.tp
@@ -293,6 +307,8 @@ class RiskEngine:
     def evaluate_reduce(self, prop: Proposal, pos: Position | None, spec: Spec) -> Verdict:
         if not pos:
             return _reject("no open position to reduce")
+        if _not_finite(prop.pct):
+            return _reject("pct is not a usable number")
         pct = min(max(prop.pct or 50.0, 1.0), 100.0)
         if pct >= 99.0:
             return Verdict(ok=True, contracts=pos.contracts, notes=["treated as a full close"])

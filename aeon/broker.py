@@ -1,6 +1,7 @@
 """Broker interface types + the paper broker (simulated fills on live prices)."""
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import asdict, dataclass, field
 
@@ -11,6 +12,18 @@ MMR = 0.005  # maintenance margin rate used by the paper liquidation model
 
 class BrokerError(Exception):
     pass
+
+
+class PendingOrder(BrokerError):
+    """An order was sent but its outcome is not confirmed yet (lost reply, fill not confirmed in time).
+    It is not a failure: the broker remembers it and books whatever really happened on a later pass."""
+
+
+def check_levels(sl: float | None, tp: float | None) -> None:
+    """Stops and targets must be real numbers: a NaN stop would never trigger."""
+    for name, v in (("stop", sl), ("target", tp)):
+        if v is not None and not math.isfinite(v):
+            raise BrokerError(f"refusing a non-numeric {name} price ({v})")
 
 
 @dataclass
@@ -148,6 +161,7 @@ class PaperBroker:
 
     async def open(self, spec: Spec, side: str, contracts: float, lever: float, sl: float | None,
                    tp: float | None, price: float, reason: str) -> Fill:
+        check_levels(sl, tp)
         if spec.inst in self.positions:
             raise BrokerError(f"{spec.inst}: position already open")
         if spec.kind == "spot":
@@ -168,6 +182,7 @@ class PaperBroker:
 
     async def add(self, spec: Spec, side: str, contracts: float, sl: float | None, tp: float | None,
                   price: float, reason: str) -> Fill:
+        check_levels(sl, tp)
         pos = self.positions.get(spec.inst)
         if not pos:
             raise BrokerError(f"{spec.inst}: no position to add to")
@@ -213,6 +228,7 @@ class PaperBroker:
         return self._reduce(spec.inst, pos.contracts, price, reason)
 
     async def set_protection(self, spec: Spec, side: str, sl: float | None, tp: float | None) -> None:
+        check_levels(sl, tp)
         pos = self.positions.get(spec.inst)
         if not pos:
             raise BrokerError(f"{spec.inst}: no position")

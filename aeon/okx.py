@@ -165,8 +165,16 @@ class OkxClient:
             raise OkxError(rows[0]["sCode"], rows[0].get("sMsg", "order rejected"), "/api/v5/trade/order")
         return rows
 
-    async def get_order(self, inst: str, ord_id: str) -> dict | None:
-        rows = await self.get("/api/v5/trade/order", {"instId": inst, "ordId": ord_id}, auth=True)
+    async def get_order(self, inst: str, ord_id: str | None = None, cl_id: str | None = None) -> dict | None:
+        """One order, by OKX's id or by the client id AEON gave it before sending (so a lost reply is recoverable)."""
+        params = {"instId": inst, "ordId": ord_id} if ord_id else {"instId": inst, "clOrdId": cl_id}
+        rows = await self.get("/api/v5/trade/order", params, auth=True)
+        return rows[0] if rows else None
+
+    async def algo_details(self, algo_id: str) -> dict | None:
+        """One stop / take-profit order, also after it fired: state (live, effective, canceled, order_failed, ...),
+        ordIdList (the order it placed when it fired) and actualSide ("sl" or "tp")."""
+        rows = await self.get("/api/v5/trade/order-algo", {"algoId": algo_id}, auth=True)
         return rows[0] if rows else None
 
     async def close_position(self, body: dict) -> list[dict]:

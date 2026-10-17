@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -212,13 +213,13 @@ def extract_json(text: str) -> dict:
     t = re.sub(r"<think>.*?</think>", "", text, flags=re.S | re.I).strip()
     t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.I).strip()
     try:
-        obj = json.loads(t)
+        obj = json.loads(t, parse_constant=_no_constant)
     except ValueError:
         s, e = t.find("{"), t.rfind("}")
         if s == -1 or e <= s:
             raise ParseError("no JSON object in the reply") from None
         try:
-            obj = json.loads(t[s:e + 1])
+            obj = json.loads(t[s:e + 1], parse_constant=_no_constant)
         except ValueError as err:
             raise ParseError(f"invalid JSON: {err}") from None
     if not isinstance(obj, dict):
@@ -226,15 +227,23 @@ def extract_json(text: str) -> dict:
     return obj
 
 
+def _no_constant(name: str) -> None:
+    """Python's JSON reader accepts NaN / Infinity, which real JSON forbids. A NaN stop would never trigger,
+    so they become 'missing' and the risk engine rejects the action."""
+    return None
+
+
 def _num(x) -> float | None:
     if x is None or isinstance(x, bool):
         return None
     if isinstance(x, (int, float)):
-        return float(x)
-    try:
-        return float(re.sub(r"[^\d.\-eE+]", "", str(x)))
-    except ValueError:
-        return None
+        v = float(x)
+    else:
+        try:
+            v = float(re.sub(r"[^\d.\-eE+]", "", str(x)))
+        except ValueError:
+            return None
+    return v if math.isfinite(v) else None
 
 
 _TYPE_ALIASES = {"buy": "open", "enter": "open", "long": "open", "short": "open", "increase": "add",

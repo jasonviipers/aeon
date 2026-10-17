@@ -366,3 +366,25 @@ Core reviewed-source SHA-256 fingerprints, unchanged between the 12:39 and final
 | `aeon/feed.py` | `38EC541B8A660246C64F3CDADE10550CF120D7D5550847E2278BBF7D5C6C55A6` |
 
 The test result is a validation checkpoint, not a safety certification. In particular, mocks that return normal successful payloads do not establish behavior under partial fills, uncertain writes, replacement failure or process interruption.
+
+## 13. Status after the first fix round (October 17, 2026)
+
+The project was put under git first (baseline commit `10d27ec`). Then the critical and high findings were fixed and each reproduced failure was turned into a regression test (`tests/test_okx_broker_kinds.py`, `tests/test_go_live_fixes.py`). Offline suite: **151 passed**. The reproduction probes for F1, F2, F5, F7 and the spot buy-recovery case now produce the correct outcome. **Still not verified against a real OKX account**: that is the purpose of the demo phase.
+
+| Finding | Status |
+|---|---|
+| F1 post-entry state | **Fixed.** Every booked fill updates positions immediately (provisional until OKX's next report). |
+| F2 spot ownership | **Fixed.** Ownership comes from AEON's own fills and its own stop orders' reported executions (`algo_details` → `ordIdList`); balances only cap what may be sold. Coins leaving without an AEON order are booked as "sold outside AEON". Spot cancellations touch only AEON's own stops. |
+| F3 unknown / partial orders | **Fixed for market orders** (open, add, reduce, spot sell): intent and client ID are saved before sending; lost replies and unconfirmed fills become `PendingOrder` and are reconciled by client ID; canceled-with-partial-fill is booked. **Open:** the derivative `close-position` path has no client-ID recovery. |
+| F4 protection verification | **Partly.** Spot: only AEON's own stop counts as protection, and re-arming waits (up to 60s) when a stop left the book until OKX says why. **Open** for perps/futures: covered size and side are not verified; cancel-then-place still has a gap. |
+| F5 fill surfaced as failure | **Fixed.** Executions are always returned and journaled; a failed stop replacement is reported separately as UNPROTECTED and retried. |
+| F6 hedge mode | **Open** (the account uses net mode). |
+| F7 non-finite numbers | **Fixed** at the JSON parser, the risk engine and both brokers. |
+| F8 close acknowledgment | **Open.** |
+| F9 freshness | **Fixed.** Per-instrument price timestamps, REST fallback for all three kinds, re-fetch before acting on a price older than 60s, no new risk on a price older than 5 minutes. |
+| F10 persistence / cycle IDs | **Partly.** Broker state is saved the moment an order is recorded or booked. Cycle-ID linking is still open. |
+| F11 paper spot buying power | **Open.** |
+| F12 accounting reconciliation | **Open** (derivative partial reductions are still estimates). |
+| F13 final command validation | **Open.** |
+| F14 configuration validation | **Open.** |
+| F15 notifications | **Fixed.** Halt and unprotected-position alerts bypass the burst cap and go out ahead of routine ones (in order); dedupe memory stays bounded when the cooldown is 0. An external heartbeat is still needed. |

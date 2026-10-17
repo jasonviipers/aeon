@@ -7,13 +7,16 @@ from collections import deque
 from dataclasses import dataclass
 
 from .brain import Context, Decision, LlmError, ParseError
-from .broker import Account, BrokerError, Fill
+from .broker import Account, BrokerError, Fill, PendingOrder
 from .config import Config
 from .feed import PriceFeed
 from .journal import Journal
 from .market import InstSnap, Market
 from .okx import OkxError, round_step
 from .risk import Proposal, RiskEngine
+
+PRICE_REFRESH_S = 60.0       # older than this: fetch the price from OKX before acting on it
+PRICE_MAX_AGE_S = 300.0      # older than this even after a refresh: never add risk on it
 
 
 @dataclass
@@ -66,6 +69,7 @@ class Agent:
         self._series: list[tuple[float, float]] = []
         self._series_ts = 0.0
         self._expiry_tried: dict[str, float] = {}
+        self._snap_ts = 0.0                              # when the current market snapshot was taken
 
     # --- account (with the capital cap) --------------------------------------
     async def _account(self, prices: dict[str, float] | None = None) -> Account:
@@ -79,6 +83,18 @@ class Agent:
             acct.available = max(min(acct.available, equity - acct.margin_used), 0.0)
             acct.equity = equity
         return acct
+
+    def _save_broker_state(self) -> None:
+        self.j.kv_set("paper_state" if self.mode == "paper" else "okx_state", self.broker.dump())
+
+    def _price(self, inst: str) -> tuple[float, float]:
+        """The freshest price we have for an instrument and its age in seconds: the live feed, or the market
+        snapshot taken at the start of this cycle, whichever is newer."""
+        price, age = self.feed.prices.get(inst, 0.0), self.feed.age(inst)
+        snap = self.snaps.get(inst)
+        if snap and self._snap_ts and time.time() - self._snap_ts < age:
+            price, age = snap.last, time.time() - self._snap_ts
+        return price, age
 
     def _name(self, inst: str) -> str:
         """Short display name: SOL for a perpetual, SOL/spot, BTC/fut-mon."""
@@ -130,6 +146,8 @@ class Agent:
                 self.emit("system", f"restored saved state: {len(state.get('known', {}))} open position(s), "
                                     f"{len(state.get('spot', {}))} spot holding(s), "
                                     f"{len(state.get('desired', {}))} stop(s) on record")
+        if hasattr(self.broker, "on_change"):              # save broker state the moment an order is recorded
+            self.broker.on_change = self._save_broker_state
         self.stats = self.j.stats()
         self.llm24 = self.j.llm_usage(time.time() - 86400)
         prices = await self._seed_prices()
@@ -333,6 +351,7 @@ class Agent:
             self.next_cycle_ts = time.time() + 45
             return
         self.snaps = await self.market.snapshot(universe, tick)
+        self._snap_ts = time.time()
         self.cycle_no += 1
         n = self.cycle_no
         ctx = Context(now=time.time(), mode=self.mode, cycle_no=n, account=acct, status=self.risk.status(acct),
@@ -389,9 +408,17 @@ class Agent:
             self.j.add_action(cycle_id, "hold", "", p.__dict__, "done", p.reason)
             return
         spec = self.market.specs.get(p.inst)
-        price = self.feed.prices.get(p.inst) or (self.snaps[p.inst].last if p.inst in self.snaps else 0.0)
+        price, age = self._price(p.inst)
+        if spec and age > PRICE_REFRESH_S:               # the model took a while, or this market is quiet: ask OKX now
+            try:
+                await self.feed.refresh([p.inst])
+            except Exception:
+                pass
+            price, age = self._price(p.inst)
         if not spec or price <= 0:
             return self._reject(p, "unknown instrument or no live price (use the exact id from the MARKET table)")
+        if p.type in ("open", "add") and age > PRICE_MAX_AGE_S:
+            return self._reject(p, f"no fresh price (the latest is {age:.0f}s old); not adding risk on a stale price")
         async with self.lock:
             try:
                 acct = await self._account()
@@ -450,6 +477,12 @@ class Agent:
                     return
                 else:
                     return self._reject(p, "unsupported action")
+            except PendingOrder as e:                     # sent, outcome unknown: the monitor books it shortly
+                self.emit("risk", f"{p.type.upper()} {self._name(p.inst)}: {e}")
+                self.j.add_action(cycle_id, p.type, p.inst, p.__dict__, "pending", str(e))
+                if p.type == "open":
+                    self.thesis.setdefault(p.inst, p.reason)
+                return
             except (BrokerError, OkxError) as e:
                 self.emit("error", f"{p.type} {p.inst} failed: {e}")
                 self.j.add_action(cycle_id, p.type, p.inst, p.__dict__, "error", str(e))
@@ -468,6 +501,9 @@ class Agent:
 
     def _record_fill(self, f: Fill, **extra) -> None:
         self.j.add_trade(f)
+        if f.event == "open" and f.reason and f.inst not in self.thesis:   # e.g. an entry booked by reconciliation
+            self.thesis[f.inst] = f.reason
+            self.j.kv_set("thesis", self.thesis)
         if f.event in ("open", "add"):
             self.risk.on_trade()
         if f.event == "close":

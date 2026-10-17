@@ -24,7 +24,7 @@ around the clock, and shows everything it thinks and does in a Bloomberg-style t
 * **Run it in this order, and only move on when each stage has behaved for a while:**
   `paper` (simulated, no keys) → `demo` (OKX demo-trading account, fake money, real order flow) → `live`.
   What is verified: the scanner (against live OKX data for all three markets), risk engine, paper broker,
-  LLM brain (including a real DeepSeek run), agent loop and UI (77 automated tests). What is **not**
+  LLM brain (including a real DeepSeek run), agent loop and UI (151 automated tests). What is **not**
   verified: the signed OKX trading calls (`okx_broker.py`) against a real account. They follow OKX's v5
   docs and are tested against a fake exchange that mimics OKX's order mechanics, but `demo` mode is where
   you confirm they behave on your account. That matters most for **spot** (its stop order is placed right
@@ -118,10 +118,29 @@ argue past them (all in `config.toml`, rejected or clipped actions are shown to 
 | Margin mode | isolated only |
 | Capital cap on demo/live (the rest of the account is never touched) | `budget_usdt = 200` |
 
-On real accounts (`demo`/`live`) every entry is a market order with its stop-loss and take-profit
-**attached and held on OKX's servers**, so protection survives AEON crashing or your network dropping.
-AEON also re-checks that every position still has a stop and re-arms it if not; if it can't restore a
+On real accounts (`demo`/`live`), perpetual and futures entries are market orders with their stop-loss and
+take-profit **attached and held on OKX's servers**, so protection survives AEON crashing or your network
+dropping. A spot buy can't carry an attached stop, so its stop is placed straight after the fill. AEON
+re-checks every few seconds that each position still has a stop and re-arms it if not; if it can't restore a
 stop within a minute it closes the position.
+
+How AEON keeps its books straight on a real account:
+
+* **Every order is recorded and saved before it is sent**, under an ID AEON chooses. If OKX's reply is lost or
+  the fill can't be confirmed in time, the agent reports the order as *pending* (not failed), and the next
+  monitor pass looks it up by that ID and books what really happened. If OKX never received it, it's
+  dropped after a minute.
+* **Spot holdings are AEON's own fills, never "whatever the wallet holds".** Coins you already own are never
+  counted, protected or sold, and stops you placed by hand on them are never cancelled. When AEON's own stop
+  or target fires, it learns that from the stop order itself, so the sale is booked even if you hold more of
+  the same coin. Coins that disappear without an AEON order are booked as "sold outside AEON".
+* **Every fill updates positions immediately**, so a second decision in the same cycle sees the first.
+* **A trade that executed is always booked**, even if replacing its stop then fails: the failure is reported
+  separately as *UNPROTECTED* and retried.
+* **No new risk on a stale price.** Each instrument's price has its own age; older than 60s it is re-fetched
+  from OKX before acting, and if it's still older than 5 minutes AEON won't open or add (closing is always allowed).
+* **Non-numbers never reach an order.** A `NaN`/`Infinity` from the model is treated as missing and rejected.
+* **Halt and unprotected-position alerts skip the Discord rate limit** and go out ahead of routine messages.
 
 ## Going from paper to real money
 
@@ -150,6 +169,16 @@ Close the laptop and AEON stops thinking (exchange-side stops keep protecting op
 `demo`/`live`; paper positions freeze). For true 24/7 put it on a small always-on machine or VPS and run
 `python -m aeon --headless`, under `systemd`, Task Scheduler or Docker. The UI and the agent currently run
 in the same process, so a headless server has no cockpit; it logs to the console and to its journal database.
+
+**Easiest path for a VPS:** a `Dockerfile` + `docker-compose.yml` are included — one container, a named
+volume for the journal, `restart: unless-stopped`, secrets from `.env`. See **`DOCKER.md`**:
+
+```bash
+cp .env.example .env && chmod 600 .env && nano .env   # keys + Discord webhook
+docker compose build
+docker compose run --rm aeon --check                  # verify before trading
+docker compose up -d                                  # survives reboots and disconnects
+```
 
 ## Controls
 
@@ -182,6 +211,7 @@ interrupts trading.
 ```
 aeon/
   config.toml        all behaviour + risk limits          .env     secrets (git-ignored)
+  Dockerfile         run it 24/7 on a VPS (see DOCKER.md)  docker-compose.yml
   aeon/
     okx.py           async OKX v5 client (public + signed)
     market.py        universe scan across perps / futures / spot, specs, indicators, basis
@@ -192,8 +222,8 @@ aeon/
     agent.py         24/7 loop: monitor + decision cycles + execution
     journal.py       SQLite journal         tui.py   the terminal UI
     notify.py        Discord alerts (webhook embeds)
-  tests/             102 tests (risk, paper accounting, order payloads against a fake OKX exchange,
-                     market scanner, prompt/parsing, agent, alerts, UI helpers)
+  tests/             151 tests (risk, paper accounting, order payloads and recovery against a fake OKX
+                     exchange, market scanner, prompt/parsing, agent, alerts, UI helpers)
 ```
 
 ## Why Python, and the Rust question

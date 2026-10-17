@@ -224,6 +224,12 @@ def _is_halt(kind: str, text: str) -> bool:
     return kind == "risk" and ("kill switch" in low or low.startswith("halted"))
 
 
+def _is_critical(kind: str, text: str) -> bool:
+    """Messages that must never be crowded out by routine traffic: halts and unprotected positions."""
+    low = text.lower()
+    return _is_halt(kind, text) or (kind in ("risk", "error") and ("unprotected" in low or "fail-safe" in low))
+
+
 # --------------------------------------------------------------------------- notifier
 class DiscordNotifier:
     """Queues events and posts them to a Discord webhook. Safe to call from sync code."""
@@ -247,7 +253,9 @@ class DiscordNotifier:
         self.throttle = 0.35                        # seconds between two posts (Discord asks ~5/s)
         self.sent = 0
         self.dropped = 0
-        self._q: deque[tuple[str, str, dict, float]] = deque(maxlen=200)
+        self._q: deque[tuple[str, str, dict, float]] = deque()   # critical first; size capped in post()
+        self._front = 0                                           # how many critical messages lead the queue
+        self.max_queue = 200
         self._seen: dict[tuple[str, str], float] = {}
         self._recent: deque[float] = deque()
         self._wake = asyncio.Event()
@@ -266,6 +274,7 @@ class DiscordNotifier:
             return
         now = time.monotonic()
         key = (kind, text)
+        critical = _is_critical(kind, text)
         if self.cfg.cooldown_s > 0:
             seen = self._seen.get(key)
             if seen is not None and now - seen < self.cfg.cooldown_s:
@@ -273,6 +282,22 @@ class DiscordNotifier:
                 return
             if len(self._seen) > 400:               # keep the dedupe table from growing forever
                 self._seen = {k: v for k, v in self._seen.items() if now - v < self.cfg.cooldown_s}
+            self._seen[key] = now
+        item = (kind, text, meta, time.time())
+        if critical:
+            # a halt or an unprotected position skips the burst cap and the line: it goes out before any routine
+            # message (critical ones keep their own order), and if the queue is full the newest routine message
+            # makes room for it
+            if len(self._q) >= self.max_queue and self._front < len(self._q):
+                self._q.pop()
+                self.dropped += 1
+            if len(self._q) >= 2 * self.max_queue:      # only criticals left and still flooding: bounded memory
+                self.dropped += 1
+                return
+            self._q.insert(self._front, item)
+            self._front += 1
+            self._wake.set()
+            return
         if self.cfg.max_per_minute > 0:
             while self._recent and now - self._recent[0] > 60.0:
                 self._recent.popleft()
@@ -280,8 +305,10 @@ class DiscordNotifier:
                 self.dropped += 1
                 return
             self._recent.append(now)
-        self._seen[key] = now
-        self._q.append((kind, text, meta, time.time()))
+        if len(self._q) >= self.max_queue:          # never evict a queued critical message for a routine one
+            self.dropped += 1
+            return
+        self._q.append(item)
         self._wake.set()
 
     def start(self) -> None:
@@ -304,6 +331,7 @@ class DiscordNotifier:
     async def _process(self) -> None:
         while self._q:
             kind, text, meta, ts = self._q.popleft()
+            self._front = max(self._front - 1, 0)
             self._busy = True
             try:
                 await self._send(build_embed(kind, text, meta, ts, self.footer),

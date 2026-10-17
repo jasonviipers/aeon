@@ -77,7 +77,7 @@ async def test_spot_proposal_without_a_side_defaults_to_long_and_trades():
     market.specs[SOL_SPOT.inst] = SOL_SPOT
     market.enabled = {"spot"}
     agent.universe = [SOL_SPOT.inst]
-    agent.feed.prices[SOL_SPOT.inst] = 100.0
+    agent.feed.set(SOL_SPOT.inst, 100.0)                   # a live price, with its timestamp
     agent.account = await agent._account({})
     await agent._handle(Proposal("open", "SOL-USDT", margin_pct=20, stop_loss=96.0, take_profit=108.0, reason="spot buy"), 1)
     assert "SOL-USDT" in broker.positions and broker.positions["SOL-USDT"].kind == "spot"

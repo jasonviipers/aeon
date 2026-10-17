@@ -1,4 +1,7 @@
-"""Live price feed: OKX public WebSocket (tickers), falling back to REST polling."""
+"""Live price feed: OKX public WebSocket (tickers), falling back to REST polling.
+
+Every price carries its own timestamp, so a busy perpetual can never make a quiet spot pair or dated
+future look fresh, and the REST fallback covers all three market kinds, not just perpetuals."""
 from __future__ import annotations
 
 import asyncio
@@ -10,11 +13,19 @@ import websockets
 from .okx import WS_PUBLIC_URL, OkxClient, OkxError
 
 
+def inst_type_of(inst: str) -> str:
+    """OKX instrument type from the id: SOL-USDT-SWAP -> SWAP, SOL-USDT -> SPOT, BTC-USD_UM-261030 -> FUTURES."""
+    if inst.endswith("-SWAP"):
+        return "SWAP"
+    return "SPOT" if inst.count("-") == 1 else "FUTURES"
+
+
 class PriceFeed:
     def __init__(self, okx: OkxClient):
         self.okx = okx
         self.prices: dict[str, float] = {}
-        self.updated: float = 0.0           # wall time of the last tick from any instrument
+        self.ts: dict[str, float] = {}      # per-instrument time of its last price
+        self.updated: float = 0.0           # wall time of the last tick from any instrument (connection health)
         self.transport = "init"             # init | ws | rest | down
         self._subs: set[str] = set()
         self._resub = asyncio.Event()
@@ -25,8 +36,27 @@ class PriceFeed:
             self._subs = new
             self._resub.set()
 
-    def age(self) -> float:
-        return time.time() - self.updated if self.updated else float("inf")
+    def set(self, inst: str, price: float, ts: float | None = None) -> None:
+        now = ts or time.time()
+        self.prices[inst] = price
+        self.ts[inst] = now
+        self.updated = max(self.updated, now)
+
+    def age(self, inst: str | None = None) -> float:
+        """Seconds since the last price: for one instrument, or (no argument) for the feed as a whole."""
+        t = self.ts.get(inst) if inst is not None else self.updated
+        return time.time() - t if t else float("inf")
+
+    async def refresh(self, insts: list[str] | set[str]) -> None:
+        """Fetch current prices for these instruments over REST, whatever their market kind."""
+        wanted = set(insts)
+        for inst_type in sorted({inst_type_of(i) for i in wanted}):
+            for row in await self.okx.tickers(inst_type):
+                if row.get("instId") in wanted:
+                    try:
+                        self.set(row["instId"], float(row["last"]))
+                    except (KeyError, ValueError, TypeError):
+                        continue
 
     async def run(self) -> None:
         backoff = 1.0
@@ -72,16 +102,12 @@ class PriceFeed:
                 continue
             for row in msg.get("data", []) if isinstance(msg, dict) else []:
                 try:
-                    self.prices[row["instId"]] = float(row["last"])
-                    self.updated = time.time()
+                    self.set(row["instId"], float(row["last"]))
                 except (KeyError, ValueError, TypeError):
                     continue
 
     async def _rest_poll(self) -> None:
         try:
-            for t in await self.okx.tickers("SWAP"):
-                if t.get("instId") in self._subs:
-                    self.prices[t["instId"]] = float(t["last"])
-                    self.updated = time.time()
-        except (OkxError, ValueError):
+            await self.refresh(self._subs)
+        except (OkxError, ValueError, AttributeError):
             self.transport = "down"
