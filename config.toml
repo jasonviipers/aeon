@@ -1,0 +1,89 @@
+# AEON configuration. Secrets (API keys) do NOT go here: put them in .env (see .env.example).
+# Unknown keys are rejected on purpose, so a typo in a risk limit can't silently do nothing.
+
+[run]
+mode = "demo"             # paper = simulated fills on live prices, no keys needed
+                          # demo  = OKX demo-trading account (needs demo API keys)
+                          # live  = REAL MONEY (also needs AEON_CONFIRM_LIVE in .env)
+brain = "llm"             # llm | heuristic (heuristic = simple rule bot, free, for testing the plumbing)
+start_equity = 200.0      # paper-mode starting balance, in USDT
+default_cycle_min = 15    # how often the agent thinks, unless it asks for a different gap
+min_cycle_min = 5         # the agent may choose its own next check-in within this range
+max_cycle_min = 60
+monitor_seconds = 5.0     # how often positions / stops / equity are re-checked
+db_path = ""              # "" = automatic: aeon-paper.db / aeon-demo.db / aeon-live.db (modes never share a journal)
+slippage = 0.0002         # paper-mode slippage per fill (0.02%)
+budget_usdt = 200.0       # demo/live: the most AEON will treat as its capital, whatever else sits in the account.
+                          # (OKX demo accounts start with ~100,000 USDT plus coins; this keeps AEON at "200".)
+                          # 0 = use the whole account equity.
+
+[universe]
+mode = "top_volume"       # top_volume = scan ALL OKX markets below, keep the most liquid few of each kind
+                          # list       = only the instrument ids named under `instruments`
+markets = ["swap", "futures", "spot"]   # perpetuals, dated expiry futures, spot (long-only). Remove any you don't want.
+                          # A kind your OKX account mode can't trade is switched off automatically, with a warning.
+top_n = 12                # perpetuals shown to the agent each cycle (more = more LLM tokens)
+top_n_futures = 5         # dated futures shown (one expiry per coin: the most liquid one with enough days left)
+top_n_spot = 6            # spot pairs shown
+min_volume_usd = 30000000 # ignore perps / spot trading less than this per 24h
+futures_min_volume_usd = 100000   # dated futures are thin (BTC's nearest trades ~$1M a day), so they get a lower bar
+futures_include_xperp = false     # OKX's 5-year "XPERP" futures (expire in 2031) trade like perpetuals; true adds them
+only_affordable = true    # hide contracts whose minimum order can't fit inside your risk limits
+categories = ["crypto"]   # OKX also lists "stocks" (198 tokenised-equity perps) and "commodities".
+                          # Add them to trade everything. Stock perps gap when US markets are closed.
+instruments = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
+
+[risk]
+# These are enforced in code, AFTER the model decides. The model cannot talk its way past them.
+max_leverage = 5
+risk_per_trade_pct = 2.0      # max loss if the stop is hit, as % of equity (size is clipped to fit)
+max_margin_pct = 35.0         # max margin on one position, as % of equity
+max_open_positions = 3
+max_exposure_x = 3.0          # total notional / equity
+min_stop_pct = 0.4            # stop must be at least this far from price (avoids instant stop-outs)
+max_stop_pct = 8.0            # ...and no further than this
+stops_only_tighten = true     # the agent may move a stop closer, never further away
+daily_loss_limit_pct = 8.0    # hit this and no new positions until 00:00 UTC
+max_drawdown_pct = 25.0       # drawdown from peak equity: flatten everything and HALT until you resume
+reentry_cooldown_min = 30     # no re-entering the same contract right after closing it
+max_trades_per_day = 24       # caps fee burn from over-trading
+fee_rate = 0.0005             # perpetual / futures taker fee assumption (0.05%)
+spot_fee_rate = 0.001         # spot taker fee assumption (0.10%)
+one_position_per_asset = true # no BTC spot + BTC perp + BTC future at the same time
+futures_min_days_to_open = 3.0    # never open a dated future this close to its expiry
+futures_close_days_before = 1.0   # AEON closes any dated future this many days before it expires
+
+[llm]
+# Any OpenAI-compatible chat-completions endpoint. Examples:
+#   OpenRouter : base_url = "https://openrouter.ai/api/v1"
+#   Cloudflare : base_url = "https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1"
+#   Anthropic  : base_url = "https://api.anthropic.com/v1"   (OpenAI-compat layer)
+#   DeepSeek   : base_url = "https://api.deepseek.com"        models: deepseek-flash (cheap), deepseek-v4-pro
+base_url = "https://api.deepseek.com"
+# Each decision cycle is ~2,100 tokens in + ~400 out (more if the model "thinks" first). `python -m aeon --check`
+# confirms the model id works. Fill in the two price fields below to see the true cost in the BRAIN tile.
+model = "deepseek-flash"
+api_key_env = "LLM_API_KEY"
+temperature = 0.3
+max_tokens = 4000             # thinking models spend part of this on reasoning: keep it generous
+timeout_s = 120
+json_mode = true              # DeepSeek supports response_format=json_object (the prompt already says "JSON")
+# DeepSeek turns "thinking" ON by default (slower, and reasoning tokens are billed as output). It is switched OFF
+# here to keep each cycle cheap and fast. To let the agent reason first, delete this line (or set type = "enabled")
+# and raise max_tokens to ~8000; optionally add  reasoning_effort = "low"  inside the table.
+extra_body = { thinking = { type = "disabled" } }
+input_price_per_m = 0.3       # USD per 1M tokens, deepseek-flash at peak-hour cache-miss rates (off-peak is half)
+output_price_per_m = 1.2
+referer = "https://localhost/aeon"
+
+[notify]
+# Discord alerts: the agent posts its fills, governor decisions, errors and boot message to a channel.
+# Setup: Discord channel -> Edit Channel -> Integrations -> Webhooks -> New Webhook -> Copy Webhook URL,
+# then put it in .env as DISCORD_WEBHOOK_URL (never in this file). `python -m aeon --check` sends a test message.
+enabled = true                # true = post alerts; needs DISCORD_WEBHOOK_URL in .env to actually send anything
+webhook_env = "DISCORD_WEBHOOK_URL"
+events = ["fill", "risk", "error"]   # any of: fill | action | risk | error | system ("think" is never posted)
+startup = true                # post one "AEON online" message on every boot and restart
+cooldown_s = 60               # identical messages inside this many seconds are dropped
+max_per_minute = 20           # hard burst cap; anything above is dropped (protects the channel)
+ping_on_halt = true           # @here when the kill switch fires / AEON halts; other messages never mention anyone
