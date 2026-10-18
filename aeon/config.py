@@ -1,9 +1,10 @@
 """Configuration: config.toml for behaviour, .env / environment for secrets."""
 from __future__ import annotations
 
+import math
 import os
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 LIVE_CONFIRM_PHRASE = "I-ACCEPT-REAL-MONEY-RISK"
@@ -113,9 +114,13 @@ def _merge(obj: object, values: dict, section: str) -> None:
         elif isinstance(current, (int, float)):
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError(f"config.toml: [{section}] {key} must be a number")
+            if isinstance(current, int) and float(value) != int(value):
+                raise ValueError(f"config.toml: [{section}] {key} must be a whole number (got {value})")
             value = type(current)(value)
         elif isinstance(current, str) and not isinstance(value, str):
             raise ValueError(f"config.toml: [{section}] {key} must be text")
+        elif isinstance(current, list) and not (isinstance(value, list) and all(isinstance(v, str) for v in value)):
+            raise ValueError(f"config.toml: [{section}] {key} must be a list of text values, e.g. [\"swap\", \"spot\"]")
         elif isinstance(current, dict) and not isinstance(value, dict):
             raise ValueError(f"config.toml: [{section}] {key} must be a table, e.g. {{ thinking = {{ type = \"disabled\" }} }}")
         setattr(obj, key, value)
@@ -170,6 +175,53 @@ class Config:
             raise ValueError("notify.cooldown_s must be 0 or more")
         if self.notify.max_per_minute < 1:
             raise ValueError("notify.max_per_minute must be 1 or more")
+        self._validate_numbers()
+
+    def _validate_numbers(self) -> None:
+        """Every number must be finite and sane. TOML accepts `nan` and `inf`, and a zero or negative limit would
+        not fail loudly: it would silently disable a safety check or spin a loop."""
+        for section in ("run", "universe", "risk", "llm", "notify"):
+            for f in fields(getattr(self, section)):
+                v = getattr(getattr(self, section), f.name)
+                if isinstance(v, float) and not math.isfinite(v):
+                    raise ValueError(f"{section}.{f.name} must be a finite number (got {v})")
+
+        def need(ok: bool, msg: str) -> None:
+            if not ok:
+                raise ValueError(msg)
+
+        r, run, u, llm = self.risk, self.run, self.universe, self.llm
+        need(run.start_equity > 0, "run.start_equity must be above 0")
+        need(run.budget_usdt >= 0, "run.budget_usdt must be 0 (use the whole account) or a positive amount")
+        need(1 <= run.min_cycle_min <= run.max_cycle_min, "run: need 1 <= min_cycle_min <= max_cycle_min")
+        need(run.default_cycle_min >= 1, "run.default_cycle_min must be 1 or more")
+        need(1.0 <= run.monitor_seconds <= 60.0, "run.monitor_seconds must be between 1 and 60 "
+                                                  "(0 would hammer the exchange; the monitor is what re-arms stops)")
+        need(0.0 <= run.slippage <= 0.05, "run.slippage must be between 0 and 0.05 (a fraction: 0.0002 = 0.02%)")
+        need(u.top_n >= 0 and u.top_n_futures >= 0 and u.top_n_spot >= 0, "universe.top_n* must be 0 or more")
+        need(u.min_volume_usd >= 0 and u.futures_min_volume_usd >= 0, "universe volume floors must be 0 or more")
+        need(u.mode != "list" or u.instruments, "universe.mode = \"list\" needs at least one entry in universe.instruments")
+        need(1 <= r.max_leverage <= 125, "risk.max_leverage must be between 1 and 125")
+        for name in ("risk_per_trade_pct", "max_margin_pct", "daily_loss_limit_pct", "max_drawdown_pct"):
+            need(0 < getattr(r, name) <= 100, f"risk.{name} must be above 0 and at most 100 (a percentage)")
+        need(r.max_open_positions >= 1, "risk.max_open_positions must be 1 or more")
+        need(r.max_exposure_x > 0, "risk.max_exposure_x must be above 0")
+        need(0 < r.min_stop_pct < r.max_stop_pct <= 100, "risk: need 0 < min_stop_pct < max_stop_pct <= 100")
+        need(r.reentry_cooldown_min >= 0, "risk.reentry_cooldown_min must be 0 or more")
+        need(r.max_trades_per_day >= 1, "risk.max_trades_per_day must be 1 or more")
+        need(0 <= r.fee_rate < 0.05 and 0 <= r.spot_fee_rate < 0.05,
+             "risk.fee_rate / spot_fee_rate are fractions between 0 and 0.05 (0.0005 = 0.05%)")
+        need(r.futures_min_days_to_open >= 0 and r.futures_close_days_before >= 0,
+             "risk.futures_*_days must be 0 or more")
+        need(r.futures_close_days_before < r.futures_min_days_to_open,
+             "risk: futures_close_days_before must be below futures_min_days_to_open, or a future would be "
+             "opened and closed again at once")
+        need(0 <= llm.temperature <= 2, "llm.temperature must be between 0 and 2")
+        need(llm.max_tokens >= 1 and llm.timeout_s > 0, "llm.max_tokens must be 1 or more and llm.timeout_s above 0")
+        need(llm.input_price_per_m >= 0 and llm.output_price_per_m >= 0, "llm prices must be 0 or more")
+        local = llm.base_url.startswith(("http://localhost", "http://127.0.0.1", "http://[::1]"))
+        need(llm.base_url.startswith("https://") or local,
+             "llm.base_url must be https:// (your API key is sent to it); plain http is only allowed for localhost")
 
     # --- secrets -------------------------------------------------------------
     def okx_credentials(self) -> tuple[str, str, str]:

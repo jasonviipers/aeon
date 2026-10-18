@@ -89,9 +89,17 @@ class OkxClient:
                 attempt += 1
                 await asyncio.sleep(0.8 * attempt)
                 continue
+            if method != "GET" and resp.status_code >= 500:
+                # A gateway or server error on a write says nothing about whether the write happened. Report it the
+                # way a lost reply is reported ("net"), so the broker looks the order up instead of assuming it failed.
+                raise OkxError("net", f"HTTP {resp.status_code} on a write: outcome unknown", path)
             try:
                 data = resp.json()
+                if not isinstance(data, dict):
+                    raise ValueError("not a JSON object")
             except ValueError:
+                if method != "GET" and resp.status_code < 400:
+                    raise OkxError("net", f"HTTP {resp.status_code} with an unreadable reply: outcome unknown", path) from None
                 raise OkxError(str(resp.status_code), resp.text[:200], path) from None
             if data.get("code") != "0":
                 detail = ""
@@ -108,6 +116,11 @@ class OkxClient:
         return await self.request("POST", path, body=body, auth=auth, retries=0)
 
     # --- public market data --------------------------------------------------
+    async def server_time(self) -> float:
+        """OKX's clock in unix seconds. Signed requests are refused when this machine's clock is off by too much."""
+        rows = await self.get("/api/v5/public/time")
+        return float(rows[0]["ts"]) / 1000.0
+
     async def instruments(self, inst_type: str = "SWAP", family: str | None = None) -> list[dict]:
         """family (e.g. "BTC-USD") is required by OKX for OPTION and optional for the other types."""
         return await self.get("/api/v5/public/instruments", {"instType": inst_type, "instFamily": family})

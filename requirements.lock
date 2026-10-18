@@ -1,0 +1,19 @@
+# Exact runtime dependency versions for the Docker image (pip install -r requirements.lock).
+# Generated from a clean `pip install .` and checked to resolve with wheels only for linux / CPython 3.12.
+# To upgrade deliberately:  pip install -U . in a scratch venv, `pip freeze --exclude aeon`, re-check, commit.
+anyio==4.15.1
+certifi==2026.10.18
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.20
+linkify-it-py==2.2.0
+markdown-it-py==4.2.0
+mdit-py-plugins==0.6.1
+mdurl==0.1.2
+platformdirs==4.13.4
+Pygments==2.21.0
+rich==15.0.0
+textual==8.2.8
+typing_extensions==4.16.0
+websockets==17.2

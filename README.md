@@ -24,10 +24,11 @@ around the clock, and shows everything it thinks and does in a Bloomberg-style t
 * **Run it in this order, and only move on when each stage has behaved for a while:**
   `paper` (simulated, no keys) → `demo` (OKX demo-trading account, fake money, real order flow) → `live`.
   What is verified: the scanner (against live OKX data for all three markets), risk engine, paper broker,
-  LLM brain (including a real DeepSeek run), agent loop and UI (151 automated tests). What is **not**
+  LLM brain (including a real DeepSeek run), agent loop and UI (219 automated tests). What is **not**
   verified: the signed OKX trading calls (`okx_broker.py`) against a real account. They follow OKX's v5
   docs and are tested against a fake exchange that mimics OKX's order mechanics, but `demo` mode is where
-  you confirm they behave on your account. That matters most for **spot** (its stop order is placed right
+  you confirm they behave on your account: `aeon.bat --smoke-demo` places, protects, moves and closes the
+  smallest possible orders on OKX demo and reports pass/fail, so run it first. That matters most for **spot** (its stop order is placed right
   after the buy, and fees are taken in the coin) and for the **dated futures**, which are new.
 * **LLM cost is a real drag on 200 EUR, so it is measured.** A cycle is ~5,200 tokens in / ~450 out (all three
   markets). At 96 cycles a day a frontier model can cost about $2/day (around 1% of the account, daily);
@@ -147,8 +148,9 @@ How AEON keeps its books straight on a real account:
 1. **Paper** (default): needs no OKX keys. Simulated fills on live prices with fees and slippage.
    Funding payments are not modelled. State survives restarts.
 2. **Demo**: in OKX open *Demo Trading*, create demo API keys, put them in `.env`, set `mode = "demo"`.
-   Run `aeon.bat --check`. Watch that entries, stops, partial closes and stop-outs all behave, for **each
-   market kind**. A demo account starts with ~100,000 USDT plus coins; `budget_usdt` makes AEON behave as
+   Run `aeon.bat --check`, then `aeon.bat --smoke-demo` (smallest orders on the demo exchange: buy, stop and
+   target visible, stop moved, close, flat; the daemon must be stopped). Then watch that entries, stops, partial
+   closes and stop-outs all behave, for **each market kind**. A demo account starts with ~100,000 USDT plus coins; `budget_usdt` makes AEON behave as
    if it had 200, so the sizes and fees look like the real thing.
 3. **Live**, when you are satisfied:
    * Create a **separate OKX sub-account** for AEON and fund it with just the 200 EUR (as USDT). AEON
@@ -171,7 +173,9 @@ Close the laptop and AEON stops thinking (exchange-side stops keep protecting op
 in the same process, so a headless server has no cockpit; it logs to the console and to its journal database.
 
 **Easiest path for a VPS:** a `Dockerfile` + `docker-compose.yml` are included — one container, a named
-volume for the journal, `restart: unless-stopped`, secrets from `.env`. See **`DOCKER.md`**:
+volume for the journal, `restart: unless-stopped`, secrets from `.env`, a read-only root filesystem, a healthcheck
+ and a watchdog that restarts a wedged agent. **`DOCKER.md` is also the go-live checklist** (rollout gates, VPS
+hardening, runbooks, backups):
 
 ```bash
 cp .env.example .env && chmod 600 .env && nano .env   # keys + Discord webhook
@@ -222,7 +226,10 @@ aeon/
     agent.py         24/7 loop: monitor + decision cycles + execution
     journal.py       SQLite journal         tui.py   the terminal UI
     notify.py        Discord alerts (webhook embeds)
-  tests/             151 tests (risk, paper accounting, order payloads and recovery against a fake OKX
+    health.py        heartbeat file, Docker healthcheck, watchdog, optional dead man's switch ping
+    smoke.py         `--smoke-demo`: exchange smoke test on OKX demo
+  requirements.lock  exact dependency versions for the image    scripts/backup.sh   online journal backup
+  tests/             219 tests (risk, paper accounting, order payloads and recovery against a fake OKX
                      exchange, market scanner, prompt/parsing, agent, alerts, UI helpers)
 ```
 

@@ -1,0 +1,7 @@
+# Line endings that must stay LF even when this folder is checked out or copied from Windows:
+# a CRLF in a shell script or Dockerfile breaks it on the Linux VPS.
+*.sh text eol=lf
+Dockerfile text eol=lf
+docker-compose.yml text eol=lf
+*.lock text eol=lf
+.env.example text eol=lf

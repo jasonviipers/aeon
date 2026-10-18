@@ -1,0 +1,30 @@
+# Keep the build context small and, most importantly, keep secrets and local state OUT of the image.
+.venv/
+.git/
+.gitignore
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Never bake a journal (it holds your trade history) or your secrets into a layer.
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+.env
+.env.*
+!.env.example
+
+# Not needed at runtime; config.toml IS copied by the Dockerfile, so it must not be ignored.
+tests/
+shots/
+*.md
+aeon.bat
+
+# Runtime artefacts that must never end up in an image.
+*.db.lock
+*.heartbeat
+backups/
+scripts/

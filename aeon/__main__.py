@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -67,7 +68,9 @@ from .brain import HeuristicBrain, LlmBrain
 from .broker import PaperBroker
 from .config import LIVE_CONFIRM_PHRASE, Config, load_dotenv
 from .feed import PriceFeed
-from .journal import Journal
+from .health import (HEALTHY_WITHIN_S, Watchdog, check_heartbeat, heartbeat_path, ping_loop, ping_url,
+                     watchdog_seconds, write_heartbeat)
+from .journal import Journal, JournalLocked
 from .market import Market
 from .notify import DiscordNotifier
 from .okx import OkxClient, OkxError
@@ -124,10 +127,37 @@ def print_event(ev: Event) -> None:
     print(f"[{stamp}] {ev.kind.upper():<6} {ev.text}", flush=True)
 
 
+def _cancel_on_sigterm() -> None:
+    """`docker stop`, `systemctl stop` and `kill` send SIGTERM. Treat it like Ctrl-C: stop cleanly, flush alerts."""
+    task = asyncio.current_task()
+    try:
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, task.cancel)
+    except (NotImplementedError, AttributeError, RuntimeError):
+        pass                                            # Windows event loops have no signal handlers
+
+
 async def run_headless(setup: Setup, once: bool) -> None:
     agent = setup.agent
     agent.on_event = print_event
-    await agent.start(decisions=not once)
+    try:
+        await agent.start(decisions=not once)
+    except Exception as e:                              # exchange unreachable at boot, bad keys, wrong account mode...
+        print(f"[aeon] startup failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        await setup.aclose()
+        raise SystemExit(1) from None
+    watchdog = pinger = None
+    if not once:
+        path = heartbeat_path(setup.cfg.run.mode)
+        agent.on_beat = lambda ts: write_heartbeat(path, ts, status=agent.status)
+        agent._beat()                                   # first heartbeat now that the file is wired up
+        limit = watchdog_seconds()
+        if limit > 0:
+            watchdog = Watchdog(agent.stalled_for, limit)
+            watchdog.start()
+        url = ping_url()
+        if url:
+            pinger = asyncio.create_task(ping_loop(url, lambda: agent.stalled_for() < HEALTHY_WITHIN_S))
+        _cancel_on_sigterm()
     try:
         if once:
             await asyncio.sleep(1)
@@ -135,8 +165,17 @@ async def run_headless(setup: Setup, once: bool) -> None:
             await asyncio.sleep(2)
         else:
             await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        print("[aeon] stopping; " + ("paper positions are only watched while AEON runs"
+                                       if setup.cfg.run.mode == "paper" else "open positions keep their exchange-side stops"),
+              file=sys.stderr, flush=True)
     finally:
+        if watchdog:
+            watchdog.stop()
+        if pinger:
+            pinger.cancel()
         await setup.aclose()
+        setup.journal.close()                           # headless only: the TUI may still be refreshing
 
 
 ACCT_LEVELS = {
@@ -172,6 +211,11 @@ async def market_coverage(pub: OkxClient, acct_lvl: str | None, op_auth: bool | 
     print(f"      {'Events':<15} {'separate prediction-market API':<34} AEON: {'not yet':<13} account: n/a")
 
 
+def clock_skew(server_ts: float, sent: float, received: float) -> float:
+    """This machine's clock minus OKX's, in seconds, assuming the reply took half the round trip."""
+    return (sent + received) / 2.0 - server_ts
+
+
 async def run_check(cfg: Config) -> int:
     ok = True
     acct_lvl: str | None = None
@@ -192,6 +236,14 @@ async def run_check(cfg: Config) -> int:
                    f"{counts['spot']} spot pairs (categories {cfg.universe.categories}, markets {cfg.universe.markets})")
     except OkxError as e:
         line(False, f"OKX public API: {e}")
+    try:
+        sent = time.time()
+        server = await pub.server_time()
+        skew = clock_skew(server, sent, time.time())
+        line(abs(skew) <= 5.0, f"system clock is {skew:+.1f}s from OKX's"
+             + ("" if abs(skew) <= 5.0 else ": signed requests are refused beyond ~30s; enable time sync (timedatectl set-ntp true)"))
+    except (OkxError, KeyError, ValueError, IndexError) as e:
+        line(False, f"OKX server time: {e}")
     if cfg.run.mode != "paper":
         key, secret, phrase = cfg.okx_credentials()
         line(bool(key and secret and phrase), "OKX credentials present in .env")
@@ -267,8 +319,13 @@ def main() -> None:
     ap.add_argument("--brain", choices=["llm", "heuristic"])
     ap.add_argument("--db", help="journal database file (default from config.toml); use a scratch file for experiments")
     ap.add_argument("--headless", action="store_true", help="no UI; log events to stdout (for a server)")
+    ap.add_argument("--tui", action="store_true", help="the terminal cockpit (the default when no mode flag is given; lets a container whose default command is --headless open it)")
     ap.add_argument("--once", action="store_true", help="run exactly one decision cycle, print it, exit")
     ap.add_argument("--check", action="store_true", help="verify config, keys and connectivity, then exit")
+    ap.add_argument("--smoke-demo", action="store_true",
+                    help="demo mode only: place, protect, move and close the smallest orders on OKX demo to verify the exchange path")
+    ap.add_argument("--healthcheck", action="store_true",
+                    help="exit 0 if a running agent's monitor has checked in recently, else 1 (used by Docker HEALTHCHECK)")
     args = ap.parse_args()
 
     load_dotenv()
@@ -287,10 +344,20 @@ def main() -> None:
     except ValueError as e:
         raise SystemExit(f"config error: {e}")
 
+    if args.healthcheck:
+        ok, msg = check_heartbeat(heartbeat_path(cfg.run.mode))
+        print(msg)
+        raise SystemExit(0 if ok else 1)
     if args.check:
         raise SystemExit(asyncio.run(run_check(cfg)))
-    setup = Setup(cfg)
-    if args.headless or args.once:
+    if args.smoke_demo:
+        from .smoke import run_smoke_demo
+        raise SystemExit(asyncio.run(run_smoke_demo(cfg)))
+    try:
+        setup = Setup(cfg)
+    except JournalLocked as e:
+        raise SystemExit(f"cannot start: {e}")
+    if (args.headless or args.once) and not args.tui:
         try:
             asyncio.run(run_headless(setup, once=args.once))
         except KeyboardInterrupt:

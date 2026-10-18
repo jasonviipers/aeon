@@ -1,0 +1,52 @@
+# AEON on your own VPS.  Bring it up with:   docker compose up -d --build
+#
+# One container, one agent, one journal — which is exactly the rule AEON needs (two processes against
+# the same journal would double-trade; the journal lock now refuses the second one). Do NOT scale this
+# service:  `--scale aeon=2` is never correct.
+services:
+  aeon:
+    build: .
+    image: aeon:latest
+    container_name: aeon
+
+    # tini as PID 1: reaps zombies and forwards signals cleanly.
+    init: true
+
+    # Ask for a clean shutdown (SIGINT is what the app's own loop handles) and give it time to close.
+    stop_signal: SIGINT
+    stop_grace_period: 30s
+
+    # Restart automatically after a crash, a watchdog exit or a host reboot; leave it down if you stop it on purpose.
+    restart: unless-stopped
+
+    # Secrets: OKX_API_KEY / OKX_API_SECRET / OKX_PASSPHRASE / LLM_API_KEY / DISCORD_WEBHOOK_URL /
+    # HEARTBEAT_URL ... (see .env.example). Read from the host file, never copied into the image.
+    env_file: .env
+
+    # Least privilege: AEON only makes outbound connections and writes to /data, so it needs nothing else.
+    user: "1000:1000"
+    read_only: true                      # the image is immutable at run time
+    tmpfs:
+      - /tmp:size=16m,mode=1777          # the heartbeat file lives here
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m                      # a runaway process cannot take the whole VPS (and its SSH) down with it
+    pids_limit: 128
+
+    volumes:
+      # Your behaviour + risk limits, edited on the host. Read-only inside the container (chmod 644 it).
+      - ./config.toml:/app/config.toml:ro
+      # The SQLite journal (aeon-<mode>.db) and its -wal/-shm files. A named volume survives
+      # rebuilds and redeploys. Back it up (scripts/backup.sh, see DOCKER.md).
+      - aeon-data:/data
+
+    # Keep logs from growing forever on a small VPS.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  aeon-data:

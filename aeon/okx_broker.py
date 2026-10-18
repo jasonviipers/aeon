@@ -100,6 +100,11 @@ class OkxBroker:
                 raise BrokerError("OKX account is in Spot mode, which cannot trade the configured markets "
                                   f"({', '.join(sorted(self.configured_kinds))}). Switch the account mode to "
                                   "'Spot and futures mode' (or Multi-currency margin).")
+        if self.pos_mode != "net_mode" and self.allowed_kinds & {"swap", "futures"}:
+            # AEON keys positions and stops by instrument, so it cannot hold a long and a short on one contract.
+            # Refuse to start rather than mis-track a hedged book.
+            raise BrokerError(f"OKX position mode is {self.pos_mode!r}; AEON supports net mode only. In OKX: "
+                              "Trade settings > Position mode > 'Net mode' (close any open positions first), then restart.")
 
     def drain_notes(self) -> list[str]:
         notes, self._notes = self._notes, []

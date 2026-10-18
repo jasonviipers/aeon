@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -22,13 +23,45 @@ CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity(ts);
 """
 
 
+class JournalLocked(RuntimeError):
+    """Another AEON process already owns this journal."""
+
+
+def take_lock(path: str):
+    """Exclusive, non-blocking lock on `<journal>.lock`, held for the life of the process (the OS drops it if the
+    process dies). Two agents on one journal would both trade the same account: this makes the second one refuse to
+    start, whether it is a stray `docker compose run`, a second container on the volume, or a forgotten terminal."""
+    fh = open(path + ".lock", "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        raise JournalLocked(f"another AEON process is already using the journal {path}. Two agents on one journal "
+                            "would double-trade: stop the other one first (docker compose stop).") from None
+    return fh
+
+
 class Journal:
     def __init__(self, path: str = "aeon.db"):
         self._lock = threading.Lock()
+        self._lock_fh = None if path == ":memory:" or path.startswith("file:") else take_lock(path)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
         self.db.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            self.db.close()
+        if self._lock_fh is not None:
+            self._lock_fh.close()                       # closing the file releases the lock
+            self._lock_fh = None
 
     def _exec(self, sql: str, args: tuple = ()) -> sqlite3.Cursor:
         with self._lock:

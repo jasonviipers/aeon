@@ -1,7 +1,7 @@
 # AEON — codebase review + running it 24/7 in the cloud
 
 *Written after a full read of the source (`aeon/*.py`, ~130 KB), a run of the test suite
-(**35 passed in 0.77s**), and a review of `config.toml`, `.env.example` and the entry points.*
+(35 tests at the time; **219 pass now**), and a review of `config.toml`, `.env.example` and the entry points.*
 
 ---
 
@@ -90,7 +90,7 @@ everything to SQLite. Between cycles a 5-second monitor loop handles stops, liqu
 | 5 | `okx_broker.py` signed calls were **never tested against a real OKX account** (README is upfront: tested for request shape only). | Medium | Must be confirmed in `demo` mode — ideally *from the server's IP* before any live money. |
 | 6 | `equity` table grows unbounded (~1 row/min ≈ 525k rows/year ≈ a few MB). No pruning/backup story. | Low | Trivial to add retention; back up `aeon.db` if you care about history. |
 | 7 | `feed.py` swallows WebSocket exceptions silently (`except Exception` with no logging) when it drops to REST. | Low | You see `feed REST` in the UI but headless gives no event for the downgrade. |
-| 8 | Only one process may ever run against a given `aeon.db` (two agents = double trading). | Info | Not a bug — just never start a second instance. |
+| 8 | Only one process may ever run against a given journal (two agents = double trading). | Info | **Now enforced:** a lock file next to the journal makes a second agent refuse to start. |
 
 Nothing here is a "this code is dangerous" finding. It's careful, defensively written code with a
 sound risk architecture; the gaps are operational (controls, alerting), not algorithmic.
@@ -167,19 +167,27 @@ tmux new -s aeon
 # detach: Ctrl-b d   re-attach later: tmux attach -t aeon
 ```
 
-### Option B — Docker / PaaS (Fly.io, Railway, Render, a NAS, a home mini-PC)
+### Option B — Docker on your own VPS *(built)*
 
-Workable: the app is a single stateless-ish container plus one file. What you must get right:
+The repo now ships a `Dockerfile`, `.dockerignore` and `docker-compose.yml`, with a full walkthrough in
+**`DOCKER.md`**. What it gets right, if you read nothing else:
 
-* **Attach a persistent volume** and point `db_path` at it (e.g. `/data/aeon.db`) — otherwise every
-  redeploy wipes the journal, the kill-switch flag and the paper account.
-* Set the env vars (`LLM_API_KEY`, OKX keys) through the platform's secret store, not a file.
-* Run exactly **one** replica. Some platforms will happily scale you to 2.
-* Use `Restart=always`-equivalent; the app assumes it is supervised.
-* Avoid free/sleeping tiers (Render free, Heroku dyno sleep): the process must never pause.
+* **Persistent volume for the journal.** The image runs from `/data` and a named volume is mounted
+  there, so the journal (and the kill-switch flag and paper balance) survives rebuilds and redeploys.
+  `config.toml` is bind-mounted read-only; secrets come from `.env` at run time, never baked in.
+* **One replica by design** (a journal lock enforces it), `restart: unless-stopped`, a clean `SIGINT`/`SIGTERM` shutdown,
+  a healthcheck, and a watchdog that exits a wedged agent so Docker restarts it.
+* **Hardened and pinned:** read-only root filesystem, no capabilities, memory cap, dependencies pinned in `requirements.lock`.
+* **Go-live gates, runbooks and backups** are in `DOCKER.md`, with an honest list of what is not verified.
+* **No free/sleeping tier.** A sleeping process is a paused trader.
 
-There is **no Dockerfile in the repo yet** — I can add one (`Dockerfile` + `docker-compose.yml`
-with a named volume) if you want this route.
+```bash
+git clone <repo> && cd aeon
+cp .env.example .env && chmod 600 .env && nano .env     # keys + Discord webhook
+docker compose build
+docker compose run --rm aeon --check                    # verify before trading
+docker compose up -d                                    # 24/7
+```
 
 ### Option C — Not suitable
 
@@ -220,7 +228,7 @@ These are the open choices, in priority order:
 
 ```
 [ ] VPS region is one where you and OKX are both OK to trade
-[ ] Server has Python ≥3.11;  pip install -e .  works;  pytest  -> 102 passed
+[ ] Server has Python ≥3.11;  pip install -e .  works;  pytest  -> all pass (219 at the time of writing)
 [ ] .env on server: chmod 600, never committed, never pasted into chat
 [ ] OKX API key: Trade permission ONLY, no Withdraw, IP allow-list = server IP
 [ ] python -m aeon --check  prints "ready" FROM THE SERVER
@@ -249,5 +257,6 @@ These are the open choices, in priority order:
   cloud"** is a remote way to pause/kill/resume (item 1 in §5). Getting alerted is now handled by the
   Discord notifier (item 2).
 
-If you confirm which option you want for §5.1 (the remote control), the next step is to build it
-(`Dockerfile` + a systemd unit are also still to come). Discord alerts (§5.2) are **done**.
+If you confirm which option you want for §5.1 (the remote control), the next step is to build it.
+Discord alerts (§5.2) and the Docker deployment (`Dockerfile` + `docker-compose.yml`, see `DOCKER.md`)
+are **done**.

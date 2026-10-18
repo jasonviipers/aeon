@@ -388,3 +388,30 @@ The project was put under git first (baseline commit `10d27ec`). Then the critic
 | F13 final command validation | **Open.** |
 | F14 configuration validation | **Open.** |
 | F15 notifications | **Fixed.** Halt and unprotected-position alerts bypass the burst cap and go out ahead of routine ones (in order); dedupe memory stays bounded when the cooldown is 0. An external heartbeat is still needed. |
+
+## 14. Status after the production-readiness round (October 19, 2026)
+
+Scope: deploy to a VPS for unattended running. Offline suite: **219 passed**. Same caveat as before: nothing here has
+touched a real OKX account. A read-only look at the demo journal on the dev machine showed 4 decision cycles in 25 hours
+and no trades, so the order, stop and reconciliation code is still verified against fakes only. `aeon --smoke-demo` and a
+demo soak on the VPS (see `DOCKER.md`, gates 2 and 3) are the way to change that.
+
+| Finding | Status |
+|---|---|
+| F3 lost / ambiguous write | **Improved.** An HTTP 5xx, or an unreadable 2xx reply, on any write is now reported as *outcome unknown* (`net`) instead of a definite rejection, so the order is looked up by client id instead of being forgotten. The derivative `close-position` path still has no client-id recovery. |
+| F6 hedge mode | **Closed by refusing.** AEON stops at start-up on a long/short position-mode account with a message saying how to switch to net mode. Hedge support itself is not built. |
+| F10 cycle linkage | **Fixed.** Every action (including rejections) is linked to the cycle's database id, not the per-run counter that restarts at 0. Persistence is still not one transaction per execution. |
+| F14 configuration | **Fixed.** NaN/inf, out-of-range percentages, zero or negative limits, inverted stop bounds, fractional counts, a non-list where a list is expected, a zero monitor interval and a non-https LLM URL are all rejected at start-up with the setting named. |
+| F15 external heartbeat | **Added, optional.** `HEARTBEAT_URL` pings a dead man's switch service while the monitor is healthy. |
+| F4, F8, F11, F12, F13 | **Unchanged / open.** Perpetual stop coverage (size, side) is not verified and replacement is cancel-then-place; a close that is acknowledged but not complete is not re-checked; paper spot buying power and derivative partial-reduction P&L are still wrong or estimated; the final rounded command is not re-validated (the exchange rejects a bad trigger price, so this fails closed). Not changed because the right behaviour depends on OKX responses that cannot be tested without an account. |
+
+Operations added: a single-instance lock on the journal; a heartbeat file, `--healthcheck` and a watchdog that exits a
+wedged agent (Docker restarts a container that exits, never one that is merely unhealthy); SIGTERM handled like Ctrl-C;
+a clear one-line failure and non-zero exit when start-up fails; a clock-skew line in `--check`; `--smoke-demo`; a
+hardened compose file (read-only filesystem, no capabilities, memory and pid caps); pinned dependencies
+(`requirements.lock`); an online, integrity-checked backup script; and runbooks in `DOCKER.md`.
+
+Found while doing this, not fixed: a spot entry raised to the exchange minimum order size can end below the minimum
+*sell* size once the buy fee is taken in the coin, so it cannot be sold and is dropped from tracking (the coins stay in the
+wallet). It needs a spot pair whose minimum order is close to the intended trade size, which the affordability filter makes
+unlikely at 200 USDT.

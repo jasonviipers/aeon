@@ -70,6 +70,8 @@ class Agent:
         self._series_ts = 0.0
         self._expiry_tried: dict[str, float] = {}
         self._snap_ts = 0.0                              # when the current market snapshot was taken
+        self.last_beat = time.time()                     # the monitor loop's last completed pass
+        self.on_beat = None                              # optional callback(ts), e.g. write the heartbeat file
 
     # --- account (with the capital cap) --------------------------------------
     async def _account(self, prices: dict[str, float] | None = None) -> Account:
@@ -175,6 +177,21 @@ class Agent:
                        asyncio.create_task(self._monitor_loop(), name="monitor")]
         if decisions:
             self._tasks.append(asyncio.create_task(self._decision_loop(), name="decisions"))
+        self._beat()
+
+    def _beat(self) -> None:
+        self.last_beat = time.time()
+        if self.on_beat:
+            try:
+                self.on_beat(self.last_beat)
+            except Exception:                            # a full disk must not take the monitor down
+                pass
+
+    def stalled_for(self) -> float:
+        """Seconds the monitor loop has been silent; infinite if a background task has died."""
+        if any(t.done() for t in self._tasks):
+            return float("inf")
+        return time.time() - self.last_beat
 
     async def stop(self) -> None:
         for t in self._tasks:
@@ -246,6 +263,7 @@ class Agent:
                 raise
             except Exception as e:                       # the monitor must never die
                 self.emit("error", f"monitor: {type(e).__name__}: {e}")
+            self._beat()
             await asyncio.sleep(self.cfg.run.monitor_seconds)
 
     async def _monitor_once(self) -> None:
@@ -362,9 +380,9 @@ class Agent:
         self.thinking = True
         decision = await self.brain.decide(ctx)
         self.thinking = False
-        self._book_decision(decision, n)
+        cycle_id = self._book_decision(decision, n)
         for prop in decision.actions:
-            await self._handle(prop, n)
+            await self._handle(prop, cycle_id)
         gap = decision.next_check_min or self.cfg.run.default_cycle_min
         gap = max(self.cfg.run.min_cycle_min, min(self.cfg.run.max_cycle_min, gap))
         self.next_cycle_ts = time.time() + gap * 60
@@ -377,7 +395,8 @@ class Agent:
             return ""
         return f" | LLM {d['tin']:,} in / {d['tout']:,} out, ${d['cost']:.4f} (24h: ${self.llm24['cost']:.4f})"
 
-    def _book_decision(self, d: Decision, n: int) -> None:
+    def _book_decision(self, d: Decision, n: int) -> int:
+        """Journal the decision and return its database id, which every action it leads to is linked to."""
         self.llm_latency = d.latency
         m = self.meter
         m["tin"] += d.tokens_in
@@ -389,18 +408,19 @@ class Agent:
         if d.notes:
             self.notes = d.notes
             self.j.kv_set("notes", self.notes)
-        self.j.add_cycle(self.mode, d.view, d.notes, d.raw, d.tokens_in, d.tokens_out, d.cost, d.latency)
+        cycle_id = self.j.add_cycle(self.mode, d.view, d.notes, d.raw, d.tokens_in, d.tokens_out, d.cost, d.latency)
         self.last_llm = dict(tin=d.tokens_in, tout=d.tokens_out, cost=d.cost, latency=d.latency)
         self.llm24 = self.j.llm_usage(time.time() - 86400)
         if d.view:
             self.emit("think", d.view)
         for w in d.warnings:
             self.emit("risk", f"model output: {w}")
+        return cycle_id
 
     # --- execution -----------------------------------------------------------
-    def _reject(self, p: Proposal, why: str) -> None:
+    def _reject(self, p: Proposal, cycle_id: int | None, why: str) -> None:
         self.emit("risk", f"REJECTED {p.type} {self._name(p.inst)}: {why}")
-        self.j.add_action(None, p.type, p.inst, p.__dict__, "rejected", why)
+        self.j.add_action(cycle_id, p.type, p.inst, p.__dict__, "rejected", why)
 
     async def _handle(self, p: Proposal, cycle_id: int) -> None:
         if p.type == "hold":
@@ -416,9 +436,9 @@ class Agent:
                 pass
             price, age = self._price(p.inst)
         if not spec or price <= 0:
-            return self._reject(p, "unknown instrument or no live price (use the exact id from the MARKET table)")
+            return self._reject(p, cycle_id, "unknown instrument or no live price (use the exact id from the MARKET table)")
         if p.type in ("open", "add") and age > PRICE_MAX_AGE_S:
-            return self._reject(p, f"no fresh price (the latest is {age:.0f}s old); not adding risk on a stale price")
+            return self._reject(p, cycle_id, f"no fresh price (the latest is {age:.0f}s old); not adding risk on a stale price")
         async with self.lock:
             try:
                 acct = await self._account()
@@ -429,7 +449,7 @@ class Agent:
                         p.side = "long"                      # spot can only be bought
                     v = self.risk.evaluate_open(p, acct, spec, price, set(self.universe))
                     if not v.ok:
-                        return self._reject(p, v.why)
+                        return self._reject(p, cycle_id, v.why)
                     self._notes(v.notes)
                     v.stop_loss, v.take_profit = self._tick(spec, v.stop_loss), self._tick(spec, v.take_profit)
                     fill = await self.broker.open(spec, p.side, v.contracts, v.leverage, v.stop_loss,
@@ -445,7 +465,7 @@ class Agent:
                 elif p.type == "add":
                     v = self.risk.evaluate_add(p, acct, spec, price)
                     if not v.ok:
-                        return self._reject(p, v.why)
+                        return self._reject(p, cycle_id, v.why)
                     self._notes(v.notes)
                     v.stop_loss, v.take_profit = self._tick(spec, v.stop_loss), self._tick(spec, v.take_profit)
                     fill = await self.broker.add(spec, pos.side, v.contracts, v.stop_loss, v.take_profit, price, p.reason)
@@ -454,7 +474,7 @@ class Agent:
                 elif p.type == "reduce":
                     v = self.risk.evaluate_reduce(p, pos, spec)
                     if not v.ok:
-                        return self._reject(p, v.why)
+                        return self._reject(p, cycle_id, v.why)
                     self._notes(v.notes)
                     fill = (await self.broker.close(spec, price, p.reason) if pos and v.contracts >= pos.contracts - 1e-12
                             else await self.broker.reduce(spec, v.contracts, price, p.reason))
@@ -462,13 +482,13 @@ class Agent:
                     extra = dict(pct=p.pct)
                 elif p.type == "close":
                     if not pos:
-                        return self._reject(p, "no open position to close")
+                        return self._reject(p, cycle_id, "no open position to close")
                     fill = await self.broker.close(spec, price, p.reason)
                     self.emit("action", f"CLOSE {self._name(p.inst)} | {p.reason}")
                 elif p.type == "adjust":
                     v = self.risk.evaluate_adjust(p, pos, price)
                     if not v.ok:
-                        return self._reject(p, v.why)
+                        return self._reject(p, cycle_id, v.why)
                     v.stop_loss, v.take_profit = self._tick(spec, v.stop_loss), self._tick(spec, v.take_profit)
                     await self.broker.set_protection(spec, pos.side, v.stop_loss, v.take_profit)
                     self.emit("action", f"ADJUST {self._name(p.inst)} -> SL {v.stop_loss:g} "
@@ -476,7 +496,7 @@ class Agent:
                     self.j.add_action(cycle_id, p.type, p.inst, p.__dict__, "done", f"SL {v.stop_loss} TP {v.take_profit}")
                     return
                 else:
-                    return self._reject(p, "unsupported action")
+                    return self._reject(p, cycle_id, "unsupported action")
             except PendingOrder as e:                     # sent, outcome unknown: the monitor books it shortly
                 self.emit("risk", f"{p.type.upper()} {self._name(p.inst)}: {e}")
                 self.j.add_action(cycle_id, p.type, p.inst, p.__dict__, "pending", str(e))

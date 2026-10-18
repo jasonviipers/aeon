@@ -88,3 +88,16 @@ async def test_unknown_instrument_gets_a_helpful_rejection():
     agent, _, _ = make_agent()
     await agent._handle(Proposal("open", "BTC-USDT-261030", side="long", stop_loss=1.0), 1)
     assert any("exact id from the MARKET table" in e.text for e in agent.events)
+
+
+async def test_every_action_links_to_the_cycles_database_id_not_a_per_run_counter():
+    from aeon.brain import Decision
+    agent, _, _ = make_agent()
+    agent.j.add_cycle("paper", "an older run", "", "", 0, 0, 0.0, 0.0)        # ids 1 and 2 are already taken
+    agent.j.add_cycle("paper", "another", "", "", 0, 0, 0.0, 0.0)
+    cid = agent._book_decision(Decision(view="now"), 1)                       # this run's cycle number 1
+    assert cid == 3
+    await agent._handle(Proposal("open", "NOPE-USDT", side="long", stop_loss=1.0), cid)    # rejected
+    await agent._handle(Proposal("hold", reason="quiet"), cid)
+    rows = agent.j._query("SELECT cycle_id, status FROM actions ORDER BY id")
+    assert rows == [(3, "rejected"), (3, "done")]
