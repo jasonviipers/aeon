@@ -227,22 +227,28 @@ def extract_json(text: str) -> dict:
     return obj
 
 
-def _no_constant(name: str) -> None:
-    """Python's JSON reader accepts NaN / Infinity, which real JSON forbids. A NaN stop would never trigger,
-    so they become 'missing' and the risk engine rejects the action."""
-    return None
+def _no_constant(name: str) -> float:
+    """Preserve non-finite constants so action validation cannot mistake them for missing fields."""
+    return float(name)
 
 
 def _num(x) -> float | None:
     if x is None or isinstance(x, bool):
         return None
     if isinstance(x, (int, float)):
-        v = float(x)
-    else:
         try:
-            v = float(re.sub(r"[^\d.\-eE+]", "", str(x)))
+            v = float(x)
+        except OverflowError:
+            return None
+    elif isinstance(x, str):
+        if not re.fullmatch(r"\s*\$?[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?(?:%|[xX])?\s*", x):
+            return None
+        try:
+            v = float(x.strip().removeprefix("$").rstrip("%xX"))
         except ValueError:
             return None
+    else:
+        return None
     return v if math.isfinite(v) else None
 
 
@@ -281,6 +287,11 @@ def parse_decision(obj: dict) -> Decision:
             continue
         side = str(a.get("side") or side_hint or "").strip().lower()
         side = {"buy": "long", "sell": "short"}.get(side, side) or None
+        numeric_fields = ("margin_pct", "leverage", "stop_loss", "sl", "take_profit", "tp", "pct", "confidence")
+        invalid = [name for name in numeric_fields if a.get(name) is not None and _num(a[name]) is None]
+        if invalid:
+            d.warnings.append(f"ignored action with invalid numeric fields: {', '.join(invalid)}")
+            continue
         d.actions.append(Proposal(
             type=t, inst=_norm_inst(a.get("inst") or a.get("instrument") or a.get("symbol")), side=side,
             margin_pct=_num(a.get("margin_pct")), leverage=_num(a.get("leverage")),

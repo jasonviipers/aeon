@@ -26,11 +26,11 @@ def acct(equity=200.0, positions=None):
 
 
 # --------------------------------------------------------------------------- NaN / infinity (finding F7)
-def test_nan_and_infinity_from_the_model_become_missing_values():
+def test_nan_and_infinity_from_the_model_reject_the_action():
     obj = extract_json('{"actions": [{"type": "open", "inst": "SOL-USDT-SWAP", "side": "long", '
                        '"stop_loss": NaN, "take_profit": Infinity, "leverage": -Infinity, "margin_pct": 10}]}')
-    a = parse_decision(obj).actions[0]
-    assert a.stop_loss is None and a.take_profit is None and a.leverage is None and a.margin_pct == 10
+    decision = parse_decision(obj)
+    assert decision.actions == [] and decision.warnings
     assert _num(float("nan")) is None and _num(float("inf")) is None and _num("1e400") is None and _num("2.5") == 2.5
 
 

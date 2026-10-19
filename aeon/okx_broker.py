@@ -30,8 +30,10 @@ where you confirm they behave on your account before real money is involved.
 from __future__ import annotations
 
 import asyncio
+import copy
 import math
 import time
+import uuid
 from dataclasses import asdict
 
 from .broker import Account, BrokerError, Fill, PendingOrder, Position, check_levels
@@ -76,6 +78,10 @@ class OkxBroker:
         self._unprotected_since: dict[str, float] = {}
         self._spot: dict[str, dict] = {}       # spot holdings AEON bought: inst -> qty, entry, fees, realized, opened_ts, since
         self._pending: dict[str, dict] = {}    # clOrdId -> an order sent but not confirmed yet
+        self._outbox: dict[str, dict] = {}
+        self._confirmed: dict[str, dict] = {}
+        self._triggered_orders: set[str] = set()
+        self.storage_fault = ""
         self._algo_ids: dict[str, list[str]] = {}   # inst -> AEON's own protective orders
         self._spot_waiting: set[str] = set()
         self._bal: dict[str, float] = {}       # coin -> total balance, refreshed on every tick
@@ -114,7 +120,9 @@ class OkxBroker:
     def dump(self) -> dict:
         return {"desired": {k: list(v) for k, v in self._desired.items()}, "spot": self._spot,
                 "known": {k: asdict(p) for k, p in self._known.items()},
-                "pending": self._pending, "algo_ids": self._algo_ids}
+                "pending": self._pending, "algo_ids": self._algo_ids,
+                "outbox": self._outbox, "confirmed": self._confirmed,
+                "triggered_orders": sorted(self._triggered_orders)}
 
     def load(self, data: dict) -> None:
         self._desired = {k: (v[0], v[1]) for k, v in (data.get("desired") or {}).items()}
@@ -122,18 +130,40 @@ class OkxBroker:
         self._known = {k: Position(**v) for k, v in (data.get("known") or {}).items()}
         self._pending = dict(data.get("pending") or {})
         self._algo_ids = {k: list(v) for k, v in (data.get("algo_ids") or {}).items()}
+        self._outbox = copy.deepcopy(data.get("outbox") or {})
+        self._confirmed = dict(data.get("confirmed") or {})
+        self._triggered_orders = set(data.get("triggered_orders") or [])
+
+    @property
+    def outbox(self) -> list[Fill]:
+        return [Fill(**row) for row in self._outbox.values()]
+
+    def ack_fills(self, ids) -> None:
+        """Acknowledge only after the caller atomically journals the outbox and broker snapshot."""
+        for execution_id in ids:
+            self._outbox.pop(execution_id, None)
 
     def _changed(self) -> None:
         if self.on_change:
             try:
                 self.on_change()
-            except Exception:
-                pass
+            except Exception as exc:
+                self.storage_fault = f"broker state persistence failed: {exc}"
+                self.last_error = self.storage_fault
+                raise BrokerError(self.storage_fault) from exc
+        self.storage_fault = ""
+
+    def _admit(self, inst: str, increasing: bool = False) -> None:
+        if increasing and self.storage_fault:
+            self._changed()
+        if any(p["inst"] == inst or (increasing and p["purpose"] in ("open", "add"))
+               for p in self._pending.values()):
+            raise PendingOrder(f"{inst}: unresolved order intent; reconcile before submitting another order")
 
     # --- small helpers -------------------------------------------------------
     def _cl_id(self) -> str:
         self._seq += 1
-        return f"aeon{int(time.time() * 1000)}{self._seq}"[:32]
+        return f"aeon{uuid.uuid4().hex[:28]}"
 
     def _pos_side(self, side: str) -> str | None:
         return side if self.pos_mode == "long_short_mode" else None
@@ -160,6 +190,7 @@ class OkxBroker:
     def _forget(self, inst: str) -> None:
         for d in (self._spot, self._known, self._desired, self._unprotected_since, self._algo_ids):
             d.pop(inst, None)
+        self._confirmed.pop(inst, None)
 
     # --- reading state -------------------------------------------------------
     async def _refresh_balances(self) -> dict:
@@ -262,11 +293,19 @@ class OkxBroker:
     async def _submit(self, spec: Spec, body: dict, intent: dict) -> dict:
         """Send one market order and wait for its fill. The intent is recorded and saved BEFORE sending, so a
         lost reply or an unconfirmed fill becomes a PendingOrder that tick() resolves by looking the order up."""
+        self._admit(spec.inst, intent["purpose"] in ("open", "add"))
         cl = self._cl_id()
+        intent["execution_id"] = cl
         body["clOrdId"] = cl
         self._pending[cl] = {**intent, "inst": spec.inst, "kind": spec.kind, "sz": float(body["sz"]),
                              "ts": time.time(), "ord_id": None}
-        self._changed()
+        try:
+            self._changed()
+        except BrokerError:
+            if spec.kind == "spot" or intent["purpose"] in ("open", "add"):
+                self._pending.pop(cl, None)
+                raise
+            self._notes.append(f"{spec.inst}: storage fault; attempting risk-reducing derivative order only")
         try:
             rows = await self.okx.place_order(body)
         except OkxError as e:
@@ -285,7 +324,6 @@ class OkxBroker:
         except (OkxError, BrokerError) as e:
             raise PendingOrder(f"{spec.inst}: order sent but its fill is not confirmed yet ({e}); "
                                "AEON will look it up and book it") from e
-        self._drop_pending(cl)
         return info
 
     def _drop_pending(self, cl: str) -> None:
@@ -302,6 +340,44 @@ class OkxBroker:
 
     # --- booking a fill (shared by the immediate path and by reconciliation) ----
     async def _book(self, spec: Spec, p: dict, info: dict) -> Fill:
+        execution_id = p.get("execution_id")
+        if not execution_id:
+            raise BrokerError("cannot book an execution without a stable execution id")
+        if execution_id in self._outbox:
+            return Fill(**self._outbox[execution_id])
+        before = copy.deepcopy(self.dump())
+        unprotected = dict(self._unprotected_since)
+        try:
+            fill = await self._book_inventory(spec, p, info)
+            fill.est = fill.est or p.get("est", False)
+            fill.execution_id = execution_id
+            self._outbox[execution_id] = asdict(fill)
+            self._pending.pop(execution_id, None)
+            if p.get("trigger_order"):
+                self._triggered_orders.add(p["trigger_order"])
+            if spec.kind != "spot":
+                pos = self._known.get(spec.inst)
+                self._confirmed[spec.inst] = {"ts": time.time(), "contracts": pos.contracts if pos else 0.0,
+                                               "side": pos.side if pos else p["side"]}
+            self._changed()
+        except Exception:
+            self.load(before)
+            self._unprotected_since = unprotected
+            raise
+        if spec.inst in self._known and (spec.kind == "spot" or p["purpose"] != "open"):
+            await self._safe_refresh_balances()
+            sl, tp = self._desired.get(spec.inst, (None, None))
+            if sl or tp:
+                await self._protect(spec, fill.side, sl, tp)
+        return fill
+
+    async def _book_inventory(self, spec: Spec, p: dict, info: dict) -> Fill:
+        if p.get("remove_algo"):
+            self._algo_ids[spec.inst] = [algo_id for algo_id in self._algo_ids.get(spec.inst, [])
+                                         if algo_id != p["remove_algo"]]
+        if p["purpose"] == "exchange_close":
+            self._forget(spec.inst)
+            return Fill(**p["fill"])
         if not info["px"]:
             info = {**info, "px": p.get("price") or 0.0}
         purpose = p["purpose"]
@@ -334,7 +410,6 @@ class OkxBroker:
         self._known[inst] = Position(inst=inst, side=side, contracts=sz, ct_val=spec.ct_val, entry=px,
                                      lever=p.get("lever") or 1.0, mark=px, sl=sl, tp=tp, fees=fee,
                                      kind=spec.kind, expiry=spec.expiry_ts)
-        self._changed()
         return Fill(time.time(), inst, side, "open", px, sz, fee, -fee, None, p.get("reason", ""))
 
     async def _book_deriv_add(self, spec: Spec, p: dict, info: dict) -> Fill:
@@ -346,8 +421,7 @@ class OkxBroker:
             pos.entry = (pos.entry * pos.contracts + px * sz) / total
             pos.contracts, pos.fees = total, pos.fees + fee
             pos.upl_exch = pos.margin_exch = None              # stale until OKX reports again
-        self._changed()
-        await self._protect(spec, side, p.get("sl"), p.get("tp"))   # re-cover the enlarged position
+        self._desired[inst] = (p.get("sl"), p.get("tp"))
         return Fill(time.time(), inst, side, "add", px, sz, fee, -fee, None, p.get("reason", ""))
 
     async def _book_deriv_reduce(self, spec: Spec, p: dict, info: dict) -> Fill:
@@ -357,14 +431,16 @@ class OkxBroker:
         entry = pos.entry if pos else p.get("entry", px)
         gross = (1 if side == "long" else -1) * (px - entry) * sz * spec.ct_val
         if pos:
+            open_fee_part = pos.fees * min(sz / pos.contracts, 1.0)
+            pos.realized += gross - fee - open_fee_part
+            pos.fees -= open_fee_part
             pos.contracts = max(pos.contracts - sz, 0.0)
             pos.upl_exch = pos.margin_exch = None
             if pos.contracts < spec.min_sz:
-                self._known.pop(inst, None)
-        self._changed()
-        sl, tp = self._desired.get(inst, (None, None))
-        if inst in self._known and (sl or tp):
-            await self._protect(spec, side, sl, tp)             # the stop now covers the smaller position
+                trade_pnl = pos.realized - pos.fees
+                self._forget(inst)
+                return Fill(time.time(), inst, side, "close", px, sz, fee, gross - fee,
+                            trade_pnl, p.get("reason", ""))
         return Fill(time.time(), inst, side, "reduce", px, sz, fee, gross - fee, None, p.get("reason", ""), est=True)
 
     async def _book_spot_buy(self, spec: Spec, p: dict, info: dict, opening: bool) -> Fill:
@@ -381,9 +457,7 @@ class OkxBroker:
             s["fees"] += fee
             s["since"] = now
         self._known[inst] = self._spot_position(inst, px)
-        self._changed()
-        await self._safe_refresh_balances()
-        await self._protect(spec, "long", p.get("sl"), p.get("tp"))
+        self._desired[inst] = (p.get("sl"), p.get("tp"))
         return Fill(now, inst, "long", "open" if opening or not s else "add", px, sz, fee, -fee, None, p.get("reason", ""))
 
     async def _book_spot_sale(self, spec: Spec, info: dict, reason: str) -> Fill:
@@ -397,7 +471,6 @@ class OkxBroker:
         if s["qty"] - sz < spec.min_sz:                         # everything (or all but dust) is gone
             trade_pnl = s["realized"] + gross - fee - s["fees"]
             self._forget(inst)
-            self._changed()
             return Fill(now, inst, "long", "close", px, sz, fee, gross - fee, trade_pnl, reason)
         open_fee_part = s["fees"] * sz / s["qty"]
         s["realized"] += gross - fee - open_fee_part
@@ -405,11 +478,6 @@ class OkxBroker:
         s["qty"] -= sz
         s["since"] = now
         self._known[inst] = self._spot_position(inst, px)
-        self._changed()
-        await self._safe_refresh_balances()
-        sl, tp = self._desired.get(inst, (None, None))
-        if sl or tp:
-            await self._protect(spec, "long", sl, tp)          # the stop now covers the smaller holding
         return Fill(now, inst, "long", "reduce", px, sz, fee, gross - fee, None, reason)
 
     # --- orders: open / add / reduce / close ---------------------------------
@@ -417,6 +485,7 @@ class OkxBroker:
                    tp: float | None, price: float, reason: str) -> Fill:
         check_levels(sl, tp)
         inst = spec.inst
+        self._admit(inst, True)
         intent = {"purpose": "open", "side": side, "sl": sl, "tp": tp, "lever": lever, "reason": reason, "price": price}
         if spec.kind == "spot":
             if side != "long":
@@ -440,7 +509,8 @@ class OkxBroker:
         except PendingOrder:
             raise
         except Exception:
-            self._desired.pop(inst, None)              # definitively nothing happened
+            if not any(p["inst"] == inst for p in self._pending.values()):
+                self._desired.pop(inst, None)
             raise
         return await self._book(spec, intent, info)
 
@@ -448,6 +518,7 @@ class OkxBroker:
                   price: float, reason: str) -> Fill:
         check_levels(sl, tp)
         inst = spec.inst
+        self._admit(inst, True)
         intent = {"purpose": "add", "side": side, "sl": sl, "tp": tp, "reason": reason, "price": price}
         if spec.kind == "spot":
             if inst not in self._spot:
@@ -463,6 +534,7 @@ class OkxBroker:
         return await self._book(spec, intent, info)
 
     async def reduce(self, spec: Spec, contracts: float, price: float, reason: str) -> Fill:
+        self._admit(spec.inst)
         if spec.kind == "spot":
             return await self._sell_spot(spec, contracts, price, reason)
         pos = self._known.get(spec.inst) or (await self._fetch_positions()).get(spec.inst)
@@ -479,33 +551,25 @@ class OkxBroker:
         return await self._book(spec, intent, info)
 
     async def close(self, spec: Spec, price: float, reason: str) -> Fill:
+        self._admit(spec.inst)
         if spec.kind == "spot":
             return await self._sell_spot(spec, None, price, reason)
         inst = spec.inst
-        pos = (await self._fetch_positions()).get(inst)
+        pos = self._known.get(inst) or (await self._fetch_positions()).get(inst)
         if not pos:
             raise BrokerError(f"{inst}: no position")
-        started = time.time()
-        body = {"instId": inst, "mgnMode": DERIV_TD_MODE, "autoCxl": True}
-        if self._pos_side(pos.side):
-            body["posSide"] = pos.side
-        await self.okx.close_position(body)
-        self._forget(inst)
-        self._changed()
-        await self._cancel_algos(inst)
-        return await self._closing_fill(pos, started, reason, price)
+        return await self.reduce(spec, pos.contracts, price, reason)
 
     async def _sell_spot(self, spec: Spec, contracts: float | None, price: float, reason: str) -> Fill:
         inst = spec.inst
+        self._admit(inst)
         if inst not in self._spot:
             raise BrokerError(f"{inst}: AEON holds no spot position here (it only sells what it bought)")
         await self._safe_refresh_balances()
         have = self._sellable(spec)
         qty = have if contracts is None else min(_floor_lot(contracts, spec.lot_sz), have)
         if qty < spec.min_sz:
-            self._forget(inst)
-            self._changed()
-            raise BrokerError(f"{inst}: balance {have:g} is below the minimum sell size, so the position was dropped from tracking")
+            raise BrokerError(f"{inst}: balance {have:g} is below the minimum sell size; retaining unresolved holdings")
         await self._cancel_algos(inst, only_ours=True)       # AEON's stop must not fire on top of this sale
         body = {"instId": inst, "tdMode": SPOT_TD_MODE, "side": "sell", "ordType": "market",
                 "sz": fmt(qty), "tgtCcy": "base_ccy"}
@@ -517,16 +581,24 @@ class OkxBroker:
     async def _cancel_algos(self, inst: str, only_ours: bool = False) -> None:
         """Cancel protective orders on an instrument. For spot only AEON's own (only_ours): a stop you placed on
         coins you hold yourself is never touched. A perpetual/future position is AEON's alone, so all of its go."""
+        live_ids = (await self._algos()).get(inst, {}).get("ids", [])
+        ours = set(self._algo_ids.get(inst, []))
+        ids = [algo_id for algo_id in live_ids if not only_ours or algo_id in ours]
+        for algo_id in ours - set(live_ids):
+            detail = await self.okx.algo_details(algo_id) or {}
+            if detail.get("state") not in ("canceled", "order_failed"):
+                raise PendingOrder(f"{inst}: protective order {algo_id} may be executing; cancellation is uncertain")
+        if ids:
+            rows = await self.okx.cancel_algos([{"algoId": algo_id, "instId": inst} for algo_id in ids])
+            if rows is not None:
+                if len(rows) != len(ids) or any(str(row.get("sCode", "")) != "0" for row in rows):
+                    raise BrokerError(f"{inst}: protective order cancellation was not confirmed: {rows}")
+        self._algo_ids.pop(inst, None)
         try:
-            ids = (await self._algos()).get(inst, {}).get("ids", [])
-            if only_ours:
-                ours = set(self._algo_ids.get(inst, []))
-                ids = [i for i in ids if i in ours]
-            if ids:
-                await self.okx.cancel_algos([{"algoId": i, "instId": inst} for i in ids])
-            self._algo_ids.pop(inst, None)
-        except OkxError as e:
-            self._notes.append(f"{inst}: could not clean up protective orders ({e.msg})")
+            self._changed()
+        except BrokerError:
+            self._algo_ids[inst] = list(ours)
+            raise
 
     async def _closing_fill(self, pos: Position, started: float, reason: str, fallback_px: float) -> Fill:
         """Ask OKX what a derivative close really realised; fall back to an estimate if history lags."""
@@ -543,10 +615,16 @@ class OkxBroker:
                     kind = {"3": "liquidated", "5": "auto-deleveraged"}.get(str(h.get("type")))
                     realized = _f(h.get("realizedPnl"))
                     px = _f(h.get("closeAvgPx"), fallback_px) or fallback_px
-                    return Fill(time.time(), pos.inst, pos.side, "close", px, pos.contracts,
-                                abs(_f(h.get("fee"))), realized, realized, kind or reason)
+                    fill = Fill(time.time(), pos.inst, pos.side, "close", px, pos.contracts,
+                                abs(_f(h.get("fee"))), realized - pos.realized + pos.fees,
+                                realized, kind or reason)
+                    fill.execution_id = f"position:{pos.inst}:{pos.side}:{pos.opened_ts}:{h.get('uTime')}"
+                    return fill
         est = pos.upl
-        return Fill(time.time(), pos.inst, pos.side, "close", fallback_px, pos.contracts, 0.0, est, est, reason, est=True)
+        fill = Fill(time.time(), pos.inst, pos.side, "close", fallback_px, pos.contracts, 0.0, est,
+                    pos.realized + est - pos.fees, reason, est=True)
+        fill.execution_id = f"position:{pos.inst}:{pos.side}:{pos.opened_ts}"
+        return fill
 
     # --- protective orders -----------------------------------------------------
     async def set_protection(self, spec: Spec, side: str, sl: float | None, tp: float | None) -> None:
@@ -584,6 +662,7 @@ class OkxBroker:
         """Orders sent but not confirmed: look each one up by its client id and book what really happened."""
         fills: list[Fill] = []
         for cl, p in list(self._pending.items()):
+            p["execution_id"] = cl
             inst = p["inst"]
             try:
                 o = await self.okx.get_order(inst, p.get("ord_id"), cl_id=cl)
@@ -607,7 +686,6 @@ class OkxBroker:
                         self._desired.pop(inst, None)
                     self._notes.append(f"{inst}: an unconfirmed order turned out canceled with nothing filled")
                 continue                                       # still working: look again next pass
-            self._drop_pending(cl)
             spec = self.specs.get(inst)
             if not spec:
                 self._notes.append(f"{inst}: an unconfirmed order filled, but its contract spec is unknown")
@@ -646,10 +724,18 @@ class OkxBroker:
                     if len(infos) < len(ord_ids):
                         self._spot_waiting.add(inst)
                         continue                               # the sale is not final yet: look again next pass
-                    self._algo_ids[inst] = [a for a in self._algo_ids.get(inst, []) if a != algo_id]
                     reason = {"sl": "stop_loss", "tp": "take_profit"}.get(d.get("actualSide"), "stop/target hit on exchange")
-                    for info in infos:
-                        fills.append(await self._book_spot_sale(spec, info, reason))
+                    for index, (oid, info) in enumerate(zip(ord_ids, infos)):
+                        execution_id = f"algo:{algo_id}:order:{oid}"
+                        if execution_id in self._triggered_orders:
+                            continue
+                        intent = {"purpose": "sell", "side": "long", "reason": reason,
+                                  "execution_id": execution_id, "trigger_order": execution_id}
+                        if state == "effective" and index == len(infos) - 1:
+                            intent["remove_algo"] = algo_id
+                        fills.append(await self._book(spec, intent, info))
+                    if state == "partially_effective" or not infos:
+                        self._spot_waiting.add(inst)
                     if not infos:
                         self._notes.append(f"{inst}: AEON's stop fired but OKX recorded no order for it; checking the balance")
                 elif state in ("canceled", "order_failed", "partially_failed"):
@@ -676,9 +762,10 @@ class OkxBroker:
             if bal >= s["qty"] - spec.lot_sz:
                 continue                                       # all of AEON's coins are still there
             gone = s["qty"] - max(bal, 0.0)
-            fill = await self._book_spot_sale(spec, {"px": prices.get(inst) or s["entry"], "sz": gone, "fee": 0.0,
-                                                     "fee_ccy": ""}, "sold outside AEON")
-            fill.est = True
+            intent = {"purpose": "sell", "side": "long", "reason": "sold outside AEON", "est": True,
+                      "execution_id": f"shortfall:{inst}:{s['opened_ts']}:{s['since']}:{s['qty']}:{bal}"}
+            fill = await self._book(spec, intent, {"px": prices.get(inst) or s["entry"], "sz": gone, "fee": 0.0,
+                                                  "fee_ccy": ""})
             fills.append(fill)
             self._notes.append(f"{inst}: {gone:g} of AEON's coins left the account without an AEON order; booked as sold")
         return fills
@@ -687,18 +774,42 @@ class OkxBroker:
     async def tick(self, prices: dict[str, float]) -> list[Fill]:
         fills: list[Fill] = []
         try:
+            fills += await self._reconcile_pending()
             await self._refresh_balances()
             current = await self._fetch_positions()
             algos = await self._algos()
         except OkxError as e:
             self.last_error = e.msg or str(e)
             return fills
-        self.last_error = ""
+        self.last_error = self.storage_fault
         pending_ids = {a for d in algos.values() for a in d["ids"]}
 
-        fills += await self._reconcile_pending()
         fills += await self._spot_triggers(pending_ids)
         fills += await self._spot_shortfalls(prices, pending_ids)
+
+        busy = {p["inst"] for p in self._pending.values()}
+        for inst, evidence in list(self._confirmed.items()):
+            observed = current.get(inst)
+            expected = evidence["contracts"]
+            matches = ((observed is None and expected == 0) or
+                       (observed is not None and observed.side == evidence["side"] and
+                        math.isclose(observed.contracts, expected, abs_tol=1e-10)))
+            if matches:
+                self._confirmed.pop(inst, None)
+            elif observed is not None or expected == 0:
+                if inst in self._known:
+                    current[inst] = copy.deepcopy(self._known[inst])
+                else:
+                    current.pop(inst, None)
+        for inst in busy:
+            if inst in self._known:
+                current[inst] = copy.deepcopy(self._known[inst])
+            else:
+                current.pop(inst, None)
+        for inst, pos in current.items():
+            old = self._known.get(inst)
+            if old and old.side == pos.side:
+                pos.fees, pos.realized = old.fees, old.realized
 
         for inst in self._spot:                                # AEON's own spot holdings, as positions
             pos = self._spot_position(inst, prices.get(inst))
@@ -707,12 +818,21 @@ class OkxBroker:
 
         # derivative positions that vanished: closed by their stop / target / liquidation on the exchange
         for inst, old in list(self._known.items()):
-            if old.kind == "spot" or inst in current:
+            if old.kind == "spot" or inst in current or inst in busy:
                 continue
-            fills.append(await self._closing_fill(old, time.time() - 120, "stop/target hit on exchange",
-                                                  prices.get(inst, old.mark)))
-            for d in (self._desired, self._unprotected_since, self._algo_ids):
-                d.pop(inst, None)
+            evidence = self._confirmed.get(inst)
+            fill = await self._closing_fill(old, evidence["ts"] if evidence else time.time() - 120,
+                                            "stop/target hit on exchange", prices.get(inst, old.mark))
+            if evidence and fill.est:
+                current[inst] = copy.deepcopy(old)
+                continue
+            spec = self.specs.get(inst)
+            if not spec:
+                current[inst] = copy.deepcopy(old)
+                continue
+            intent = {"purpose": "exchange_close", "side": old.side, "execution_id": fill.execution_id,
+                      "fill": asdict(fill)}
+            fills.append(await self._book(spec, intent, {}))
 
         for inst, pos in current.items():
             a = algos.get(inst)
@@ -730,7 +850,9 @@ class OkxBroker:
                 continue            # not a position AEON opened: leave it alone
             pos.sl, pos.tp = want
             first = self._unprotected_since.setdefault(inst, time.time())
-            if inst in self._spot_waiting and time.time() - first < 60:
+            if inst in self._spot_waiting:
+                if time.time() - first >= 60:
+                    self._notes.append(f"{inst}: UNPROTECTED: protective order outcome is uncertain; reconcile or close by hand")
                 continue            # its stop just left the book: it may have sold the coins, so don't re-arm blind
             try:
                 await self.set_protection(spec, pos.side, *want)
@@ -746,4 +868,5 @@ class OkxBroker:
                         self._notes.append(f"{inst}: fail-safe close FAILED ({e2}); close it by hand")
         closed = {f.inst for f in fills if f.event == "close"}
         self._known = {i: p for i, p in current.items() if i not in closed}
+        self._changed()
         return fills

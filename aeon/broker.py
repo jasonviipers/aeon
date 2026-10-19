@@ -92,6 +92,7 @@ class Fill:
     trade_pnl: float | None = None  # whole-trade net pnl, set on the closing fill
     reason: str = ""
     est: bool = False               # True when the figure is an estimate, not an exchange record
+    execution_id: str = ""
 
 
 @dataclass
@@ -146,7 +147,8 @@ class PaperBroker:
         return self.balance + sum(p.upl for p in self.positions.values())
 
     def _available(self) -> float:
-        return self._equity() - sum(p.margin for p in self.positions.values())
+        return self._equity() - sum(p.notional if p.kind == "spot" else p.margin
+                                    for p in self.positions.values())
 
     @staticmethod
     def _liq(p: Position) -> float:

@@ -205,4 +205,11 @@ class OkxClient:
         return rows
 
     async def cancel_algos(self, items: list[dict]) -> list[dict]:
-        return await self.post("/api/v5/trade/cancel-algos", items)
+        path = "/api/v5/trade/cancel-algos"
+        rows = await self.post(path, items)
+        if len(rows) != len(items):
+            raise OkxError("net", "protective cancellation reply incomplete; outcome unknown", path)
+        for row in rows:
+            if str(row.get("sCode", "")) != "0":
+                raise OkxError(str(row.get("sCode", "net")), row.get("sMsg") or "protective cancellation failed", path)
+        return rows

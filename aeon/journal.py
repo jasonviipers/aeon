@@ -6,6 +6,7 @@ import os
 import sqlite3
 import threading
 import time
+from datetime import datetime, timezone
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -53,7 +54,12 @@ class Journal:
         self._lock_fh = None if path == ":memory:" or path.startswith("file:") else take_lock(path)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript(SCHEMA)
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(trades)")}
+        if "execution_id" not in columns:
+            self.db.execute("ALTER TABLE trades ADD COLUMN execution_id TEXT")
+        self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_execution ON trades(execution_id)")
         self.db.commit()
 
     def close(self) -> None:
@@ -98,6 +104,10 @@ class Journal:
             (time.time(), mode, view, notes, raw, tin, tout, cost, latency))
         return int(cur.lastrowid)
 
+    def last_cycle_ts(self) -> float | None:
+        """When the last decision was booked, or None if there never was one."""
+        return self._query("SELECT MAX(ts) FROM cycles")[0][0]
+
     def llm_usage(self, since: float = 0.0) -> dict:
         """Model calls, tokens and cost recorded since `since` (unix seconds; 0 = all time)."""
         r = self._query("SELECT COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0), COALESCE(SUM(cost),0) "
@@ -113,10 +123,37 @@ class Journal:
         return [dict(ts=r[0], type=r[1], inst=r[2], status=r[3], detail=r[4]) for r in reversed(rows)]
 
     # --- trades --------------------------------------------------------------
-    def add_trade(self, f) -> None:
-        self._exec(
-            "INSERT INTO trades(ts,inst,side,event,price,contracts,fee,pnl,trade_pnl,reason,est) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (f.ts, f.inst, f.side, f.event, f.price, f.contracts, f.fee, f.pnl, f.trade_pnl, f.reason, int(f.est)))
+    def _insert_trade(self, fill) -> bool:
+        execution_id = getattr(fill, "execution_id", "") or None
+        cursor = self.db.execute(
+            "INSERT INTO trades(ts,inst,side,event,price,contracts,fee,pnl,trade_pnl,reason,est,execution_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(execution_id) DO NOTHING",
+            (fill.ts, fill.inst, fill.side, fill.event, fill.price, fill.contracts, fill.fee,
+             fill.pnl, fill.trade_pnl, fill.reason, int(fill.est), execution_id))
+        return cursor.rowcount > 0
+
+    def add_trade(self, fill) -> bool:
+        with self._lock, self.db:
+            return self._insert_trade(fill)
+
+    def save_broker_state(self, key: str, state: dict, fills=()) -> None:
+        from .broker import Fill
+
+        pending_fills = [Fill(**value) for value in state.get("outbox", {}).values()]
+        encoded = json.dumps(state, allow_nan=False)
+        with self._lock, self.db:
+            for fill in [*pending_fills, *fills]:
+                self._insert_trade(fill)
+            self.db.execute("INSERT INTO kv(key,value) VALUES(?,?) "
+                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, encoded))
+
+    def risk_activity(self, now: float | None = None) -> tuple[int, dict[str, float]]:
+        current = datetime.fromtimestamp(time.time() if now is None else now, timezone.utc)
+        start = current.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        count = self._query("SELECT COUNT(*) FROM trades WHERE event IN ('open','add') AND ts>=?",
+                            (start,))[0][0]
+        closed = self._query("SELECT inst,MAX(ts) FROM trades WHERE event='close' GROUP BY inst")
+        return count, dict(closed)
 
     def recent_trades(self, n: int = 8) -> list[dict]:
         rows = self._query(

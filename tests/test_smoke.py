@@ -31,6 +31,10 @@ class SmokeExchange(FakeExchange):
     async def place_order(self, body):
         rows = await super().place_order(body)
         if body["tdMode"] == "isolated":
+            if body.get("reduceOnly"):
+                self.pos_rows["SWAP"] = []
+                self.algos = [algo for algo in self.algos if algo["instId"] != body["instId"]]
+                return rows
             inst, px = body["instId"], self.px[body["instId"]]
             self.pos_rows["SWAP"] = [{"instId": inst, "pos": body["sz"], "posSide": "net", "avgPx": str(px),
                                       "markPx": str(px), "lever": "2", "upl": "0", "cTime": str(int(time.time() * 1000))}]

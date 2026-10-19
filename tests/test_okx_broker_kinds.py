@@ -296,16 +296,22 @@ async def test_a_stop_that_just_left_the_book_is_not_re_armed_blind():
     assert [f.reason for f in fills] == ["stop_loss"] and b._spot == {} and ex.algos == []
 
 
-async def test_if_okx_never_explains_a_vanished_stop_aeon_re_arms_after_a_minute():
+async def test_a_vanished_stop_is_never_re_armed_blind_and_alerts_instead():
+    """If OKX never explains where AEON's spot stop went, AEON must NOT re-arm it or sell the coins: the
+    wallet balance can include coins you hold by hand, so a blind re-arm could sell yours. It fails closed,
+    keeps ownership, and says so — indefinitely, not just for the first minute."""
     ex, b = await broker()
     await b.open(SOL, "long", 2.0, 1.0, sl=95.0, tp=None, price=100.0, reason="t")
     await b.tick({"SOL-USDT": 100.0})
     ex.algos.clear()
     await b.tick({"SOL-USDT": 100.0})
-    assert ex.algos == []
-    b._unprotected_since["SOL-USDT"] -= 61                                  # a minute goes by
-    await b.tick({"SOL-USDT": 100.0})
-    assert len(ex.algos) == 1 and ex.algos[0]["sz"] == "1.998"
+    assert ex.algos == []                                                   # not re-armed immediately...
+    b._unprotected_since["SOL-USDT"] -= 61                                  # ...nor a minute later
+    fills = await b.tick({"SOL-USDT": 100.0})
+    assert ex.algos == []                                                   # never a blind re-arm
+    assert not [f for f in fills if f.event == "close"]                     # never an overlapping spot sale
+    assert "SOL-USDT" in b._spot and "SOL-USDT" in b._known                 # ownership is retained
+    assert any("UNPROTECTED" in n for n in b.drain_notes())                 # ...and it is reported loudly
 
 
 async def test_a_stop_that_is_not_ours_does_not_count_as_protection():

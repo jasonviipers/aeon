@@ -19,9 +19,9 @@
 * Dependencies are tiny (`textual`, `httpx`, `websockets`), Python ≥ 3.11. A $4–6/month VPS is
   more than enough.
 
-What is **not** ready yet (and needs a small decision from you) is in section 5 — the biggest item
-is that headless mode has **no keyboard controls**: pause / flatten / kill-switch / resume only
-exist in the terminal UI.
+What was **not** ready (section 5) was that headless mode had **no keyboard controls**: pause / flatten /
+kill-switch / resume only existed in the terminal UI. That is now **done**: `python -m aeon --ctl ...`
+(local, token-protected; see `DOCKER.md` Section 5).
 
 ---
 
@@ -83,7 +83,7 @@ everything to SQLite. Between cycles a 5-second monitor loop handles stops, liqu
 
 | # | Issue | Severity | Notes |
 |---|---|---|---|
-| 1 | **Headless mode has no control channel.** Pause / Think-now / Flatten / Kill-switch / Resume are TUI key bindings only. On a server you cannot press `K` or `R`. | **High for your use case** | Kill state persists, so a drawdown halt stays halted until someone with a keyboard intervenes. See §5. |
+| 1 | **Headless mode had no control channel.** Pause / Think-now / Flatten / Kill-switch / Resume were TUI key bindings only. | **High for your use case** | **Addressed:** `python -m aeon --ctl status\|pause\|unpause\|cycle\|flatten\|kill\|resume` talks to the running daemon over a loopback-only, token-protected channel (`aeon/control.py`). Kill state persists; `resume` resets the drawdown baseline like the TUI's `R`. See `DOCKER.md` §5. |
 | 2 | **No alerts** was the gap: nothing told you the process died, the LLM had failed for an hour, or the kill switch fired — you only found out by reading logs. | High when unattended | **Addressed:** a Discord notifier (`aeon/notify.py`, `[notify]` in `config.toml`) now posts fills, governor decisions, errors and a boot message as clean embeds. See `README.md` → Discord alerts. |
 | 3 | **No observability surface.** No web view, no health endpoint. You read `journalctl` and query `aeon.db`. | Medium | Fine for a first version; a read-only status page would make hosting much more comfortable. |
 | 4 | **UI and agent share one process.** A headless server therefore has no cockpit (README says this explicitly). | Medium | Workaround: run the TUI inside `tmux` over SSH (§4, option B). |
@@ -203,7 +203,9 @@ docker compose up -d                                    # 24/7
 
 These are the open choices, in priority order:
 
-1. **How do you control it remotely?** (required — pick one)
+1. **How do you control it remotely?** ✅ **Done: option A**, as a local command rather than an HTTP endpoint
+   (`python -m aeon --ctl ...`, loopback listener + token file, no port to tunnel; `DOCKER.md` §5). The options
+   as originally listed:
    * **A. I add a control channel**: a tiny localhost HTTP endpoint (or stdin commands) for
      `pause / resume / flatten / kill / status`, callable over SSH tunnel. Small, clean change
      (~50 lines in `agent.py` + `__main__.py`). ← my recommendation
@@ -236,7 +238,7 @@ These are the open choices, in priority order:
 [ ] Run demo mode from the server IP; confirm entries/stops/partial closes/stop-outs
 [ ] systemd (or Docker) with Restart=always;  systemctl enable
 [ ] db_path on local disk;  aeon.db backed up (cron + scp/rsync)
-[ ] Control channel decided (A/B/C above) and tested: pause, kill, resume
+[ ] Control channel tested on the server: `--ctl status`, pause, flatten, kill, resume (DOCKER.md §5)
 [ ] Discord alerts tested (`python -m aeon --check` posts a real message to the channel)
 [ ] Only ONE instance ever runs against this db_path
 [ ] Cost watch: BRAIN meter > your limit -> change model / raise cycle gap
@@ -249,14 +251,13 @@ These are the open choices, in priority order:
 * **The code**: above-average for this kind of project — the risk-after-decision architecture,
   exchange-side stops with a fail-safe re-arm loop, persisted kill state and strict config are the
   right instincts, and the tests cover what actually loses money. The weaknesses are operational
-  (no remote controls, no alerts, no web view), not structural.
+  (no web view; remote controls and alerts now exist), not structural.
 * **Hosting**: absolutely possible and effectively pre-designed for it (`--headless`, outbound-only,
   SQLite state, restart-safe). Cheapest sane path is a ~$5 VPS under `systemd`; Docker/PaaS works
   with a persistent volume; serverless does not.
-* **The one thing still standing between "runs in the cloud" and "I can live with it running in the
-  cloud"** is a remote way to pause/kill/resume (item 1 in §5). Getting alerted is now handled by the
-  Discord notifier (item 2).
+* **The thing that stood between "runs in the cloud" and "I can live with it running in the cloud"**
+  was a remote way to pause/kill/resume (item 1 in §5). It now exists (`--ctl`, `DOCKER.md` §5), and getting
+  alerted is handled by the Discord notifier (item 2).
 
-If you confirm which option you want for §5.1 (the remote control), the next step is to build it.
-Discord alerts (§5.2) and the Docker deployment (`Dockerfile` + `docker-compose.yml`, see `DOCKER.md`)
-are **done**.
+The remote control (§5.1), Discord alerts (§5.2) and the Docker deployment (`Dockerfile` +
+`docker-compose.yml`, see `DOCKER.md`) are **done**. None of it has run against a real OKX account yet.

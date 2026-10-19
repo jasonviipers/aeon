@@ -13,6 +13,7 @@ Three small, independent pieces:
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import tempfile
@@ -43,9 +44,13 @@ def write_heartbeat(path: Path, ts: float | None = None, **info) -> None:
 def check_heartbeat(path: Path, max_age: float = HEALTHY_WITHIN_S, now: float | None = None) -> tuple[bool, str]:
     try:
         beat = json.loads(path.read_text(encoding="utf-8"))
-        age = (now or time.time()) - float(beat["ts"])
+        age = (now or time.time()) - float(beat.get("last_success", beat["ts"]))
     except (OSError, ValueError, KeyError, TypeError):
         return False, f"no readable heartbeat at {path}"
+    if not math.isfinite(age) or age < -5:
+        return False, "invalid monitor heartbeat timestamp"
+    if beat.get("error"):
+        return False, f"monitor degraded: {beat['error']}"
     if age > max_age:
         return False, f"monitor silent for {age:.0f}s (limit {max_age:.0f}s)"
     return True, f"monitor alive {age:.0f}s ago"

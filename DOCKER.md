@@ -8,6 +8,8 @@ go-live checklist. Read "What is and is not verified" before putting real money 
 - **State**: the SQLite journal lives in the `aeon-data` volume at `/data/aeon-<mode>.db`
 - **Safety rail**: a second AEON on the same journal refuses to start (lock file), so `docker compose run` can
   never double-trade next to the daemon
+- **Control**: `docker compose exec aeon python -m aeon --config /app/config.toml --ctl status|pause|unpause|cycle|flatten|kill|resume`
+  talks to the running daemon over a loopback-only, token-protected channel (Section 5). No port is published
 
 ---
 
@@ -15,8 +17,9 @@ go-live checklist. Read "What is and is not verified" before putting real money 
 
 | Verified | How |
 |---|---|
-| 219 offline tests pass | `pytest` against fakes, including a fake OKX with lost replies, partial fills, stop firing |
+| 345 offline tests pass (2 more are skipped on Windows: POSIX file modes) | `pytest` against fakes, including a fake OKX with lost replies, partial fills, stop firing, the control channel's auth, limits, confirmation and resume semantics, and the terminal UI at sizes from 200x50 down to 64x18 in Textual's headless harness |
 | The headless process end to end | Run for real on Windows in paper mode: heartbeat written, healthcheck passes, a second agent on the same journal is refused, the lock is released when the first dies |
+| The control channel against a real headless process | Run on Windows in paper mode with the real CLI: `status`, `pause` (twice), `unpause`, `cycle`, `flatten` with and without `--yes`, `kill`, `resume` with and without a halt, wrong `--mode`, and a stale file after a hard kill |
 | Backup logic | Run against a live WAL journal with an open writer: consistent, `integrity_check` ok |
 | `docker-compose.yml` is valid YAML with the hardening keys; the lock file resolves for linux / CPython 3.12 with wheels only | Parsed / `pip install --dry-run --platform manylinux2014_x86_64` |
 
@@ -25,6 +28,7 @@ go-live checklist. Read "What is and is not verified" before putting real money 
 | The Docker image was never **built or run** (no Docker on the dev machine) | First step on the VPS: `docker compose build`, then check `docker inspect` health reaches `healthy` |
 | The terminal UI inside the container (`--tui`, Section 5) on a read-only filesystem | Try it at Gate 3 item 7; if it will not start, run the TUI from a Python virtualenv on the VPS instead, with the daemon stopped |
 | SIGTERM handling and `flock` on Linux (written, tested on Windows only) | Gate 2 below: `docker compose stop` must log `stopping; open positions keep their exchange-side stops` |
+| The control channel on Linux and inside the container: the token file really is `0600` and owned by uid 1000, `docker compose exec` (as uid 1000 and as root) reaches the daemon, the file disappears on `docker compose stop` | Gate 2, once: `docker compose exec aeon ls -l /tmp` then `aeonctl status` (Section 5); the two POSIX-only tests run on Linux (`pytest tests/test_control.py`) |
 | **The OKX order path has never run against a real exchange, not even demo.** The demo journal on the dev machine shows 4 decision cycles in 25 hours and zero trades | `--smoke-demo` (Gate 2) then a demo soak (Gate 3) |
 | Anything about profitability | Nothing here tests it. Treat the money as an experiment you can lose |
 
@@ -38,7 +42,7 @@ go-live checklist. Read "What is and is not verified" before putting real money 
 | **1. Verify** | `docker compose run --rm aeon --check` | Every line `[ok]`: OKX public + private reachable, **clock within 5 s of OKX**, key has no Withdraw, LLM replies, Discord test message arrives |
 | **2. Smoke test (demo)** | `docker compose run --rm aeon --smoke-demo` with `mode = "demo"`, daemon stopped | `SMOKE TEST PASSED`: perpetual and spot legs both buy, show stop and target on the exchange, move the stop, close, and end flat. Then `docker compose up -d` and `docker compose stop`: the log must show a clean stop |
 | **3. Demo soak, 7+ days on the VPS** | Leave it running in `demo` | See the list below, all observed at least once |
-| **4. Live, small** | Section 6 | First week with deliberately tight limits (below) and you watching Discord |
+| **4. Live, small** | Section 6 | First week on the shipped limits (below) and you watching Discord |
 | **5. Scale** | Only after a clean week | Raise limits one at a time |
 
 **Gate 3: watch for each of these at least once** (Discord / `docker compose logs`, and the OKX demo web UI):
@@ -48,11 +52,14 @@ go-live checklist. Read "What is and is not verified" before putting real money 
 4. A VPS reboot (`sudo reboot`): the container comes back by itself, `docker inspect` shows `healthy`.
 5. `HEARTBEAT_URL` alert actually reaching you after `docker compose stop` (Section 7).
 6. A spot buy, its stop, and the stop firing.
-7. A flatten and a kill + resume, done from the TUI (Section 5).
+7. A flatten, a pause and unpause, and a kill + resume, done with `--ctl` (Section 5), each confirmed by `--ctl status` and the Discord audit line.
 
-**Gate 4 first-week limits** (edit `config.toml`, then `docker compose restart`): `max_leverage = 2`,
-`risk_per_trade_pct = 0.5`, `max_open_positions = 2`, `budget_usdt` = only what you can lose. AEON's
-`budget_usdt` is a sizing cap, **not isolation**: fund a dedicated OKX **sub-account** with just that amount.
+**The shipped `config.toml` already is the first-week set**, for demo and live alike, so what you soak is what goes
+live and there is nothing to edit: demo mode, `max_leverage = 2`, `risk_per_trade_pct = 0.5`, `max_open_positions = 2`,
+daily loss limit 2%, drawdown halt 10%, 10 entries a day, perpetuals and spot only (dated futures are opt-in:
+nothing exercises them on the exchange yet). The one number that is yours is `budget_usdt` (default 200): for live,
+set it to what you can lose. It is a sizing cap, **not isolation**: fund a dedicated OKX **sub-account** with just that
+amount. Gate 5 loosens one limit at a time; `config.toml` carries the next-step value beside each.
 
 ---
 
@@ -119,6 +126,8 @@ docker inspect -f '{{.State.Health.Status}}' aeon     # "starting" for ~3 min, t
 | I want to... | Do this |
 |---|---|
 | See what it is doing | `docker compose logs -f --tail=100` |
+| Ask it: state, equity, positions with stops, halt reason | `aeonctl status` (alias in Section 5) |
+| Pause, flatten, kill or resume it | `aeonctl pause`, `aeonctl flatten --yes`, `aeonctl kill --yes`, `aeonctl resume --yes` (Section 5) |
 | Check health and restarts | `docker inspect -f '{{.State.Health.Status}} restarts={{.RestartCount}}' aeon` |
 | Stop it (positions keep their exchange-side stops) | `docker compose stop` |
 | Start it again | `docker compose start` |
@@ -133,21 +142,72 @@ Anything else aimed at the daemon's own journal refuses with `another AEON proce
 
 ## 5. Runbooks
 
+### Remote control: status, pause, flatten, kill, resume
+The running daemon answers a local command, so you no longer need the terminal UI. Run it on the VPS (over SSH).
+Set this alias once; `-T` keeps the output clean and makes it work from scripts and cron:
+
+```bash
+alias aeonctl='docker compose exec -T aeon python -m aeon --config /app/config.toml --ctl'
+aeonctl status
+```
+
+| Command | What it does |
+|---|---|
+| `status` | Mode, `RUNNING` / `PAUSED` / `HALTED`, equity, open positions with stop and target, drawdown / day P&L / exposure, the halt reason, last decision time, and how long ago the monitor last checked in (`stalled_for`). The stop and target are **what AEON has on record**, not a fresh read from OKX (`CODEBASE_REVIEW.md` F4) |
+| `pause` / `unpause` | Stop / start new decision cycles. Open positions keep their stops. Repeating either is harmless. **Not saved**: a restart (watchdog, `docker compose restart`, reboot) comes back unpaused |
+| `cycle` | One decision cycle now (the TUI's `C`). Refused while halted or while a decision is already running |
+| `flatten --yes` | Close every open position at market. Trading continues afterwards |
+| `kill --yes` | Close every position and halt. Saved: it survives restarts until `resume` |
+| `resume --yes` | Lift a halt **and reset the drawdown baseline to current equity**, exactly as `R` does in the TUI. Refused when not halted, so it can never quietly reset a live drawdown |
+
+`flatten`, `kill` and `resume` do nothing without `--yes` (the agent checks it too, not just the CLI). Each one writes
+`control channel: <command> requested` to the log and to Discord before it runs. Exit code: `0` done, `1` the agent
+refused (for example `nothing to resume`), `2` could not talk to it or `--yes` missing.
+
+It reads the mode from `config.toml` like `--healthcheck` does. If you started the daemon with a different `--mode`,
+pass the same flag; the error message tells you when a control file for another mode exists.
+
+**How it is kept safe**
+- No published port, and nothing listens on the network: the listener is `127.0.0.1` inside the container on a random
+  port. **Never add `ports:` or `network_mode: host` to this service**: host networking would put that listener on
+  the VPS's own loopback, where any local user could try it (they would still need the token).
+- Every request must carry a random token, new at each start, in `/tmp/aeon-<mode>.control` (the container's
+  private tmpfs, mode `0600`, owned by uid 1000, deleted on stop). It is never logged, printed, echoed or put on a
+  command line. The client refuses a token file that is not a regular file, not its own (root excepted), or readable by others.
+- Anyone who can `docker exec` into the container, or read that file as root, can drive the trader. Treat membership
+  of the `docker` group on the VPS as access to the account.
+- Requests are one JSON line of at most 4 KB, read within 5 s, from at most 4 connections at once. `flatten` and
+  `kill` keep running to completion even if your SSH session drops; a command that takes over 90 s answers "still
+  working" and carries on (check `status`).
+- `AEON_CONTROL=off` in `.env` (then `docker compose up -d --force-recreate`) turns the whole thing off.
+- If the channel cannot start (for example the tmpfs is full) the trader keeps running and an `error` alert says
+  that pause / flatten / kill / resume need the terminal UI until the next restart.
+
 ### Alert: "Kill switch / halt" (HALTED)
-The drawdown limit fired: AEON flattened everything and will not trade until **you** resume it. Read the log and the
-Discord history first. To resume you need the terminal UI (headless has no control channel yet, see Section 8):
+The drawdown limit fired (or someone ran `kill`): AEON flattened everything and will not trade until **you** resume it.
+Look first, resume second:
+
+```bash
+aeonctl status                          # HALTED: <reason>; positions should be flat
+docker compose logs --tail=200 aeon     # what happened; compare with the Discord history and the OKX web UI
+aeonctl resume --yes                    # only when you understand why: restarts the drawdown clock from current equity
+```
+
+Resuming re-bases the drawdown limit to the equity you have **now**, so each resume after a loss lets AEON lose
+another full drawdown limit. If you are not sure, leave it halted. If `aeonctl` cannot connect, the fallback is the
+terminal UI with the daemon stopped (`F` flatten, `K` kill, `R` resume, `P` pause):
 
 ```bash
 docker compose stop
-docker compose run --rm -it aeon --tui      # review, then press R (resets the drawdown baseline to now), then Q
+docker compose run --rm -it aeon --tui      # review, then press R, then Q
 docker compose start
 ```
 
-The same TUI gives you `F` flatten, `K` kill switch, `P` pause. Run it only while the daemon is stopped.
-
 ### Emergency: get out of the market now
-There is no remote kill switch. The fastest way out does not depend on AEON: **close the positions and cancel the
-algo orders in the OKX app or website.** Then `docker compose stop`. (AEON books a hand-closed position as
+If AEON is healthy (`aeonctl status` answers): `aeonctl kill --yes` closes everything and keeps it from trading again.
+The route that does not depend on AEON at all is still the fastest and the one to use when `aeonctl` cannot connect,
+the container is `unhealthy`, or you do not trust what AEON reports: **close the positions and cancel the algo orders
+in the OKX app or website.** Then `docker compose stop`. (AEON books a hand-closed position as
 `stop/target hit on exchange`; that is expected.) `docker compose stop` alone only stops new decisions: open
 positions stay open, protected by their exchange-side stops.
 
@@ -203,8 +263,9 @@ restart.
 1. Gates 1-3 passed on this VPS, in `demo`.
 2. A dedicated OKX **sub-account**, funded with only the budget; account mode *Spot and futures* or *Multi-currency
    margin*, **position mode = Net** (AEON refuses hedge mode), API key **Trade-only**, restricted to the VPS IP.
-3. `.env`: the live key and `AEON_CONFIRM_LIVE=I-ACCEPT-REAL-MONEY-RISK`. `config.toml`: `mode = "live"` plus the
-   first-week limits from Section 1. `docker compose up -d --force-recreate`.
+3. `.env`: the live OKX key, `AEON_MODE=live` and `AEON_CONFIRM_LIVE=I-ACCEPT-REAL-MONEY-RISK`. `config.toml` needs no
+   edit apart from `budget_usdt` (set it to the amount in the sub-account); the limits are already the first-week set.
+   `docker compose up -d --force-recreate` (`restart` does not re-read `.env`).
 4. Stay on Discord for the first sessions. The live journal is separate (`aeon-live.db`), so demo history does not carry over.
 
 ## 7. Monitoring: how you find out it is not running
@@ -220,8 +281,12 @@ restart.
 
 ## 8. Known limitations (honest list)
 
-- **No remote control channel in headless mode** (pause / flatten / kill / resume are TUI keys). Workarounds above.
-  Building one is an open decision in `HOSTING.md` Section 5.
+- **The control channel is local and only as alive as the agent.** You reach it by SSH to the VPS plus `docker compose
+  exec`; there is deliberately no remote endpoint. It runs inside the agent's event loop, so a wedged agent cannot
+  answer (the watchdog restarts it after `AEON_WATCHDOG_S`, default 10 minutes; use the OKX app meanwhile). `pause` is not
+  saved, so any restart resumes deciding; `kill` is. `flatten` / `kill` report what AEON's own account view shows
+  after closing, and a close that OKX acknowledges but does not complete is not re-checked (F8): confirm on OKX after
+  an emergency. Not yet run on Linux or in the container (Section 0).
 - Perpetual and future stops are replaced by cancel-then-place, so there is a short gap; the 5-second monitor re-arms
   a missing stop and closes the position if it cannot within 60 seconds. Covered size and side of an existing stop are
   not verified (`CODEBASE_REVIEW.md` F4). A close that OKX acknowledges but does not complete is not re-checked (F8).

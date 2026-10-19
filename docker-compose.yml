@@ -2,7 +2,8 @@
 #
 # One container, one agent, one journal — which is exactly the rule AEON needs (two processes against
 # the same journal would double-trade; the journal lock now refuses the second one). Do NOT scale this
-# service:  `--scale aeon=2` is never correct.
+# service:  `--scale aeon=2` is never correct. Do not add `ports:` or `network_mode: host` either: the control channel
+# (`python -m aeon --ctl`, see DOCKER.md) listens on the container's own loopback and relies on that staying private.
 services:
   aeon:
     build: .
@@ -27,7 +28,7 @@ services:
     user: "1000:1000"
     read_only: true                      # the image is immutable at run time
     tmpfs:
-      - /tmp:size=16m,mode=1777          # the heartbeat file lives here
+      - /tmp:size=16m,mode=1777          # the heartbeat file and the control channel's 0600 token file live here
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true

@@ -1,4 +1,4 @@
-"""Entry point:  python -m aeon [--headless | --once | --check] [--mode paper|demo|live] [--brain llm|heuristic]"""
+"""Entry point:  python -m aeon [--headless | --once | --check | --ctl COMMAND] [--mode paper|demo|live] [--brain llm|heuristic]"""
 from __future__ import annotations
 
 import importlib
@@ -67,6 +67,7 @@ from .agent import Agent, Event  # noqa: E402
 from .brain import HeuristicBrain, LlmBrain
 from .broker import PaperBroker
 from .config import LIVE_CONFIRM_PHRASE, Config, load_dotenv
+from .control import COMMANDS, DESCRIPTIONS, ControlServer, control_enabled, control_path, run_ctl
 from .feed import PriceFeed
 from .health import (HEALTHY_WITHIN_S, Watchdog, check_heartbeat, heartbeat_path, ping_loop, ping_url,
                      watchdog_seconds, write_heartbeat)
@@ -136,6 +137,23 @@ def _cancel_on_sigterm() -> None:
         pass                                            # Windows event loops have no signal handlers
 
 
+async def _start_control(agent: Agent, mode: str) -> ControlServer | None:
+    """The local control channel (`--ctl`). Losing it must never stop the trader, but the operator is told loudly."""
+    if not control_enabled():
+        print("[aeon] control channel is off (AEON_CONTROL)", file=sys.stderr, flush=True)
+        return None
+    server = ControlServer(agent, control_path(mode))
+    try:
+        await server.start()
+    except Exception as e:
+        agent.emit("error", f"control channel unavailable ({type(e).__name__}: {e}); pause/flatten/kill/resume "
+                            "need the terminal UI until the agent is restarted")
+        return None
+    print(f"[aeon] control channel ready on 127.0.0.1 (token file {server.path}, mode 0600); "
+          "python -m aeon --ctl status", file=sys.stderr, flush=True)
+    return server
+
+
 async def run_headless(setup: Setup, once: bool) -> None:
     agent = setup.agent
     agent.on_event = print_event
@@ -145,10 +163,13 @@ async def run_headless(setup: Setup, once: bool) -> None:
         print(f"[aeon] startup failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         await setup.aclose()
         raise SystemExit(1) from None
-    watchdog = pinger = None
+    watchdog = pinger = control = None
     if not once:
+        control = await _start_control(agent, setup.cfg.run.mode)
         path = heartbeat_path(setup.cfg.run.mode)
-        agent.on_beat = lambda ts: write_heartbeat(path, ts, status=agent.status)
+        agent.on_beat = lambda ts: write_heartbeat(path, ts, status=agent.status,
+                                                   last_success=agent.last_successful_monitor,
+                                                   error=agent.monitor_error)
         agent._beat()                                   # first heartbeat now that the file is wired up
         limit = watchdog_seconds()
         if limit > 0:
@@ -174,6 +195,8 @@ async def run_headless(setup: Setup, once: bool) -> None:
             watchdog.stop()
         if pinger:
             pinger.cancel()
+        if control:
+            await control.stop()
         await setup.aclose()
         setup.journal.close()                           # headless only: the TUI may still be refreshing
 
@@ -326,6 +349,10 @@ def main() -> None:
                     help="demo mode only: place, protect, move and close the smallest orders on OKX demo to verify the exchange path")
     ap.add_argument("--healthcheck", action="store_true",
                     help="exit 0 if a running agent's monitor has checked in recently, else 1 (used by Docker HEALTHCHECK)")
+    ap.add_argument("--ctl", choices=COMMANDS, metavar="COMMAND",
+                    help="talk to a running headless agent on this machine: "
+                         + "; ".join(f"{c} = {DESCRIPTIONS[c]}" for c in COMMANDS))
+    ap.add_argument("--yes", action="store_true", help="confirm --ctl flatten / kill / resume")
     args = ap.parse_args()
 
     load_dotenv()
@@ -348,6 +375,8 @@ def main() -> None:
         ok, msg = check_heartbeat(heartbeat_path(cfg.run.mode))
         print(msg)
         raise SystemExit(0 if ok else 1)
+    if args.ctl:
+        raise SystemExit(run_ctl(cfg.run.mode, args.ctl, args.yes))
     if args.check:
         raise SystemExit(asyncio.run(run_check(cfg)))
     if args.smoke_demo:

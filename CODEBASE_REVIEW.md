@@ -415,3 +415,82 @@ Found while doing this, not fixed: a spot entry raised to the exchange minimum o
 *sell* size once the buy fee is taken in the coin, so it cannot be sold and is dropped from tracking (the coins stay in the
 wallet). It needs a spot pair whose minimum order is close to the intended trade size, which the affordability filter makes
 unlikely at 200 USDT.
+
+## 15. Status after the headless control channel (October 19, 2026)
+
+Scope: the one operational gap left by section 14, namely that a headless daemon could not be paused, flattened, killed
+or resumed (so a drawdown halt on the VPS meant stopping the daemon and running the TUI). Offline suite: **309 passed,
+2 skipped** (311 after section 16) (the skips are POSIX file-mode checks that only run on Linux). Same caveat as before: nothing here has touched
+a real OKX account, and this was run on Windows only.
+
+| Item | Status |
+|---|---|
+| Headless pause / kill / resume / status (section 7, Phase B) | **Built** (`aeon/control.py`; `python -m aeon --ctl status\|pause\|unpause\|cycle\|flatten\|kill\|resume`). It is a local, authenticated boundary, not an endpoint: a listener on `127.0.0.1` on a random port, no published port, a per-start random token in a `0600` file next to the heartbeat file, compared in constant time. Requests are one JSON line (4 KB, 5 s, 4 connections). `flatten`, `kill` and `resume` need an explicit `--yes`, enforced by the server. It calls only the `Agent` methods the TUI keys call. |
+| `resume` semantics | **Same as the TUI's `R`.** Refused unless the kill switch is tripped, because `Agent.resume()` resets the drawdown peak to current equity and doing that on a healthy agent would erase a real drawdown. Covered by a test that compares the control path with `Agent.resume()` field by field. |
+| `pause` / `unpause` | **Idempotent** on purpose (the agent only has a toggle), so a retried command cannot flip the state back. |
+| Audit | Each `flatten` / `kill` / `resume` request logs `control channel: <cmd> requested` as a `risk` event, which the default Discord settings forward. The wording avoids "kill switch" so it does not trigger the halt ping; the agent's own `KILL SWITCH:` line still does. |
+| Failure handling | A command that raises returns `internal error` and leaves the server and the trader running. If the channel cannot start, the trader still runs and an `error` alert says so. `flatten` / `kill` run as a shielded job, so a dropped SSH session or the 90 s reply timeout does not cancel a half-finished close; shutdown waits up to 15 s for one. |
+| Exit criterion for Phase B | **Partly met.** An operator can now halt and resume without a keyboard on the box or editing database rows. They still cannot tell *protected* from *unknown*: `status` shows the stop and target AEON has on record, not a verified exchange read (F4 stays open). |
+
+Open, found while doing this:
+- **`pause` is in memory only.** After a watchdog exit, `docker compose restart` or a reboot the agent decides again. The
+  TUI has the same behaviour, but an unattended, auto-restarting daemon makes it matter more. Persisting it means
+  changing `Agent`, which this change deliberately did not do.
+- **`flatten` / `kill` inherit F8.** They report the result from AEON's own post-close account refresh; a close OKX
+  acknowledges but does not complete is not re-checked, and the derivative `close-position` path has no client-id recovery (F3).
+- **Not verified on Linux or in the container:** the `0600` creation and ownership check, `docker compose exec` as uid
+  1000 and as root, removal of the token file on `docker compose stop`. The image has never been built here.
+- On Windows the token file's protection is the per-user temp directory's ACL, not mode bits.
+
+## 16. Shipped defaults retuned for unattended deployment (October 19, 2026)
+
+`config.toml` is now the deployment set, so a first deploy needs `.env` and nothing else. Offline suite: **311 passed,
+2 skipped**. These are judgements about safety for a system that has never traded for real, **not measurements**:
+there is no backtest or evaluation harness (section 7, Phase C), so no number below is shown to make money.
+
+| Setting | Was | Now | Why |
+|---|---|---|---|
+| `risk_per_trade_pct` / `max_open_positions` / `max_leverage` | 2.0 / 3 / 5 | 0.5 / 2 / 2 | One stopped-out trade costs ~$1 on 200 USDT, two positions put ~1% at risk at once. Leverage does not change what a stop costs (size comes from the risk limit), it only moves liquidation closer. The values DOCKER.md already prescribed for the first live week |
+| `daily_loss_limit_pct` / `max_drawdown_pct` | 8 / 25 | 2 / 10 | At 0.5% a trade the old 8% day limit needed sixteen stop-outs, so it could never act first. Now it is four, and the halt is twenty. A halt is cheap since `--ctl resume` exists; a 25% loss on an untested system is not |
+| `min_stop_pct` | 0.4 | 1.0 | 0.4% is inside normal 15-minute noise and a 0.1% round-trip fee was a quarter of what it risked (now a tenth) |
+| `max_margin_pct` / `max_exposure_x` | 35 / 3.0 | 30 / 1.5 | The exposure cap sat far above what the other limits allow (2 x 30% x 2x = 1.2x); it is now a close backstop |
+| `reentry_cooldown_min` / `max_trades_per_day` | 30 / 24 | 60 / 10 | Fees alone are capped near 0.5% of equity a day; no re-entry on the next cycle after a stop-out |
+| `min_cycle_min` | 5 | 10 | The agent's indicators come from 15-minute bars; stops sit on the exchange and the monitor runs every 5 s regardless |
+| `universe.markets` | swap, futures, spot | swap, spot | `--smoke-demo` and the rollout gates exercise perpetuals and spot on the exchange; dated futures (thin, ~$1M/day) have no exchange test. Add `"futures"` back after watching a demo day without them |
+
+Unchanged on purpose: `mode = "demo"` (real money stays a separate, explicit switch: `AEON_MODE=live` plus
+`AEON_CONFIRM_LIVE` in `.env`), `budget_usdt = 200`, the LLM block (model id, prices and the thinking switch were
+checked against DeepSeek's published docs), the universe filters, fee assumptions and notification settings. A test
+(`test_the_shipped_config_is_safe_to_deploy_untouched`) pins the properties, not the numbers: never live, a capped budget,
+only smoke-tested market kinds, a daily brake that comes before the drawdown halt, fees small against the tightest stop.
+Checked against live OKX data: the agent still sees 12 perpetuals and 4 spot pairs with nothing excluded as unaffordable,
+and the real risk engine sizes a trade at ~$1 maximum loss across 1-8% stops.
+
+## 17. The terminal UI made responsive (October 19, 2026)
+
+Report: the cockpit was "not responsive at all". Measured rather than guessed, with the real `AeonApp` in Textual's
+headless harness against live OKX public data (paper, rule bot). It was **not slow**: `refresh_ui` cost ~3 ms and the
+event loop's worst stalls were 30-110 ms. It was **not adaptive**: the layout assumed a very large terminal. At 120x35
+the agent stream got 2 rows; at 80x24 the chart was 7 columns wide, the watchlist 4 lines and the agent stream had no room
+at all; the positions table was 200 columns wide inside an 80-column box.
+
+| Change | Detail |
+|---|---|
+| Layout tiers | wide (150+ cols): three columns. medium (100-149): two columns, risk / executions / LLM meter in a row below. narrow (<100): one scrolling column, the agent stream first. Short (<30 rows): the header tape and KPI tiles collapse to one line each. Re-flows live on resize |
+| Tables | `FitTable` shows the columns that fit, by importance, and re-chooses them when resized; the thesis column takes the leftover width. Spot and perp rows of one coin keep their TYPE column |
+| Panels | KPI tiles drop trailing detail instead of cutting words; the risk bars and LLM meter size to their panel; the header drops its least important pieces first |
+| Cost | Panels and table cells are only redrawn when their content changed (a price whose digits are the same but whose tick colour flipped still counts as changed) |
+| Robustness | One panel raising no longer takes the whole terminal down (it is reported once in the stream). A refresh tick that arrives before the first layout, or during shutdown, is ignored instead of raising; the error handler itself used to be able to raise. Events are marked shown only after they are. Quit no longer waits forever on a hung shutdown (8 s). Flatten and kill now say they started |
+| Dialogs | Confirm and Memory fit small terminals (percentage widths with a maximum) |
+
+Tests (`tests/test_tui_layout.py`, 34): tier boundaries, column choice, header fitting, then the real app at seven
+sizes from 200x50 to 64x18 (every panel gets a usable area, nothing sticks out sideways, no table overflows, everything
+fits without scrolling when the terminal is big enough), live resizing through all tiers keeping rows and DOM order,
+keys and scrolling, refresh cost, no redraw when nothing changed, a broken panel, dialogs on a 60x20 terminal, a hung
+quit, a failed boot. Suite: **345 passed, 2 skipped**; it is ~20 s slower because of them.
+
+Not verified: rendering in a real terminal emulator (Windows Terminal, SSH with tmux, `docker compose run -it`) and
+real input latency there: everything above ran in Textual's headless harness, which composes the same screen but has no
+terminal on the other end. Only Textual 8.2.8 (the lock file's version) was tested; `pyproject.toml` still allows
+`>=0.80`. Glyph widths (`◢◤ ◈ ▕`) differ between fonts and can misalign a border by a cell. Cycle timing and agent CPU
+work were not changed.

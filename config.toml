@@ -1,26 +1,38 @@
 # AEON configuration. Secrets (API keys) do NOT go here: put them in .env (see .env.example).
 # Unknown keys are rejected on purpose, so a typo in a risk limit can't silently do nothing.
+#
+# THE DEFAULTS BELOW ARE THE DEPLOYMENT SET: demo mode, capital-preserving limits, the markets the exchange smoke test
+# covers. Deploying needs only .env (keys) and nothing in this file. They are a judgement about safety for an
+# unproven system, not a measured optimum: nothing in this repo can show that any number here makes money. Loosen
+# the risk limits only after a clean week (DOCKER.md Gate 5), one setting at a time, using the "next step" values
+# in the comments. To go live without editing this file, set AEON_MODE=live and AEON_CONFIRM_LIVE in .env (DOCKER.md Section 6).
 
 [run]
 mode = "demo"             # paper = simulated fills on live prices, no keys needed
                           # demo  = OKX demo-trading account (needs demo API keys)
                           # live  = REAL MONEY (also needs AEON_CONFIRM_LIVE in .env)
+                          # (the AEON_MODE environment variable overrides this line)
 brain = "llm"             # llm | heuristic (heuristic = simple rule bot, free, for testing the plumbing)
 start_equity = 200.0      # paper-mode starting balance, in USDT
 default_cycle_min = 15    # how often the agent thinks, unless it asks for a different gap
-min_cycle_min = 5         # the agent may choose its own next check-in within this range
+min_cycle_min = 10        # the agent may choose its own next check-in within this range. Its indicators are built from
+                          # 15-minute bars, so looking more often than every ~10 min adds cost and churn, not information.
+                          # Stops sit on the exchange and the monitor re-checks every 5 s regardless of this.
 max_cycle_min = 60
 monitor_seconds = 5.0     # how often positions / stops / equity are re-checked
 db_path = ""              # "" = automatic: aeon-paper.db / aeon-demo.db / aeon-live.db (modes never share a journal)
 slippage = 0.0002         # paper-mode slippage per fill (0.02%)
 budget_usdt = 200.0       # demo/live: the most AEON will treat as its capital, whatever else sits in the account.
                           # (OKX demo accounts start with ~100,000 USDT plus coins; this keeps AEON at "200".)
-                          # 0 = use the whole account equity.
+                          # 0 = use the whole account equity: never do that on a real account.
+                          # For live, set this to what you can afford to lose and fund a dedicated sub-account with it.
 
 [universe]
 mode = "top_volume"       # top_volume = scan ALL OKX markets below, keep the most liquid few of each kind
                           # list       = only the instrument ids named under `instruments`
-markets = ["swap", "futures", "spot"]   # perpetuals, dated expiry futures, spot (long-only). Remove any you don't want.
+markets = ["swap", "spot"]   # perpetuals and spot (long-only): the two kinds `--smoke-demo` exercises on the exchange.
+                          # Add "futures" for dated expiry futures once you have watched a demo day without it: they are
+                          # thin (BTC's nearest trades ~$1M a day, so wider spreads) and no exchange test covers them yet.
                           # A kind your OKX account mode can't trade is switched off automatically, with a warning.
 top_n = 12                # perpetuals shown to the agent each cycle (more = more LLM tokens)
 top_n_futures = 5         # dated futures shown (one expiry per coin: the most liquid one with enough days left)
@@ -35,22 +47,30 @@ instruments = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
 
 [risk]
 # These are enforced in code, AFTER the model decides. The model cannot talk its way past them.
-max_leverage = 5
-risk_per_trade_pct = 2.0      # max loss if the stop is hit, as % of equity (size is clipped to fit)
-max_margin_pct = 35.0         # max margin on one position, as % of equity
-max_open_positions = 3
-max_exposure_x = 3.0          # total notional / equity
-min_stop_pct = 0.4            # stop must be at least this far from price (avoids instant stop-outs)
+# The set is sized for a ~200 USDT account that has never traded for real. What it works out to:
+#   one stopped-out trade loses about 0.5% of equity (~$1 on 200); two open positions put ~1% at risk at once;
+#   the daily limit is four full stop-outs; the drawdown halt is twenty. A 1% stop sizes a position to ~45% of equity
+#   in notional (so ~23% margin at 2x). Each entry costs ~0.1% round trip on perps (0.2% spot): at most ~0.5% of
+#   equity a day in fees, however busy the agent is.
+max_leverage = 2              # leverage does not change what a stop costs (size is set by risk_per_trade_pct); it only
+                              # moves liquidation closer. At 2x liquidation is ~50% away, far beyond any stop. Next step: 3
+risk_per_trade_pct = 0.5      # max loss if the stop is hit, as % of equity (size is clipped to fit). Next step: 1.0
+max_margin_pct = 30.0         # max margin on one position, as % of equity (spot: the share of equity spent on it)
+max_open_positions = 2        # correlated crypto moves together, so more positions mostly means more of the same bet
+max_exposure_x = 1.5          # total notional / equity: a backstop just above what the limits above allow (2 x 30% x 2x = 1.2)
+min_stop_pct = 1.0            # stop must be at least this far from price. Tighter than this is inside normal 15-minute
+                              # noise, and fees (0.1%) would eat a quarter or more of what the stop risks
 max_stop_pct = 8.0            # ...and no further than this
 stops_only_tighten = true     # the agent may move a stop closer, never further away
-daily_loss_limit_pct = 8.0    # hit this and no new positions until 00:00 UTC
-max_drawdown_pct = 25.0       # drawdown from peak equity: flatten everything and HALT until you resume
-reentry_cooldown_min = 30     # no re-entering the same contract right after closing it
-max_trades_per_day = 24       # caps fee burn from over-trading
-fee_rate = 0.0005             # perpetual / futures taker fee assumption (0.05%)
-spot_fee_rate = 0.001         # spot taker fee assumption (0.10%)
+daily_loss_limit_pct = 2.0    # hit this and no new positions until 00:00 UTC (counts open losses and fees)
+max_drawdown_pct = 10.0       # drawdown from peak equity: flatten everything and HALT until you resume (python -m aeon --ctl resume --yes).
+                              # Each resume restarts this clock from current equity, so look at why before you resume
+reentry_cooldown_min = 60     # no re-entering the same contract right after closing it (no revenge trades)
+max_trades_per_day = 10       # entries per day: caps fee burn from over-trading
+fee_rate = 0.0005             # perpetual / futures taker fee assumption (0.05%, OKX's standard tier)
+spot_fee_rate = 0.001         # spot taker fee assumption (0.10%, OKX's standard tier)
 one_position_per_asset = true # no BTC spot + BTC perp + BTC future at the same time
-futures_min_days_to_open = 3.0    # never open a dated future this close to its expiry
+futures_min_days_to_open = 3.0    # never open a dated future this close to its expiry (only matters if "futures" is enabled)
 futures_close_days_before = 1.0   # AEON closes any dated future this many days before it expires
 
 [llm]

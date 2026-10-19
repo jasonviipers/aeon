@@ -22,7 +22,7 @@ async def test_spot_round_trip_pays_the_spot_fee_and_uses_all_cash():
     assert pos.kind == "spot" and pos.lever == 1.0 and pos.liq is None and pos.margin == pytest.approx(100.0)
     assert f_open.fee == pytest.approx(0.1)                                    # 0.1% of $100, not 0.05%
     acct = await b.account({"SOL-USDT": 110.0})
-    assert acct.available == pytest.approx(200 - 0.1 + 10 - 100)               # cash left after paying for the coins
+    assert acct.available == pytest.approx(200 - 0.1 - 100)
     f_close = await b.close(SOL_SPOT, 110.0, "t")
     assert f_close.trade_pnl == pytest.approx(10.0 - 0.1 - 0.11)
     assert b.balance == pytest.approx(200 + f_close.trade_pnl)

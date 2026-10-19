@@ -68,7 +68,7 @@ class InstSnap:
     chg24h: float = 0.0          # %
     vol_usd: float = 0.0
     funding: float | None = None  # per 8h, as a fraction (0.0001 = 0.01%); perpetuals only
-    ret15m: float = 0.0          # % over last 15m candle-open to now
+    ret15m: float = 0.0          # % from the closed-bar reference at/before price time minus 15m
     ret1h: float = 0.0
     ret4h: float = 0.0
     rsi15: float | None = None
@@ -86,11 +86,35 @@ class InstSnap:
     days_left: float | None = None   # dated futures
     basis: float | None = None       # futures premium over the spot index, %
     ann_basis: float | None = None   # the same, annualised, %
+    price_ts: float = 0.0       # unix seconds; exchange ticker milliseconds converted at ingestion
 
 
 def _parse_candles(rows: list[list[str]]) -> tuple[list[float], list[float], list[float]]:
     rows = sorted(rows, key=lambda r: int(r[0]))
     return [float(r[2]) for r in rows], [float(r[3]) for r in rows], [float(r[4]) for r in rows]
+
+
+def _closed_candles(rows: list[list[str]], interval: float, asof: float) -> list[list[str]]:
+    """Use only bars closed by ticker time; an explicit OKX confirm=0 always excludes a bar.
+
+    Legacy rows without the confirm column are accepted only after their scheduled close.
+    """
+    return sorted((row for row in rows if (len(row) < 9 or str(row[8]) == "1")
+                   and int(row[0]) / 1000.0 + interval <= asof), key=lambda row: int(row[0]))
+
+
+def _horizon_return(last: float, rows: list[list[str]], interval: float, asof: float, horizon: float) -> float:
+    """Compare ticker to the latest confirmed close at/before the rolling lookback.
+
+    No forming-bar close or future close is used. Missing history (a reference at least
+    one full bar older than the lookback) yields the existing unavailable value, zero.
+    """
+    target = asof - horizon
+    for row in reversed(rows):
+        closed = int(row[0]) / 1000.0 + interval
+        if closed <= target:
+            return pct_change(last, float(row[4])) if target - closed < interval else 0.0
+    return 0.0
 
 
 class Market:
@@ -146,6 +170,7 @@ class Market:
     # --- tickers / universe ----------------------------------------------------
     async def tickers(self) -> dict[str, dict]:
         kinds = [k for k in INST_TYPE if k in self.enabled]
+        started = time.time()
         batches = await asyncio.gather(*(self.okx.tickers(INST_TYPE[k]) for k in kinds))
         out: dict[str, dict] = {}
         for kind, rows in zip(kinds, batches):
@@ -158,7 +183,8 @@ class Market:
                     open24 = float(t.get("open24h") or last)
                     vol = float(t.get("volCcy24h") or 0)          # spot: already in USDT; derivatives: in coins
                     out[spec.inst] = {"last": last, "chg24h": pct_change(last, open24),
-                                      "vol_usd": vol if kind == "spot" else vol * last}
+                                      "vol_usd": vol if kind == "spot" else vol * last,
+                                      "price_ts": float(t.get("ts") or started * 1000.0) / 1000.0}
                 except (KeyError, ValueError):
                     continue
         return out
@@ -221,12 +247,15 @@ class Market:
             return None
 
     async def _one(self, inst: str, base: dict, spec: Spec, index: dict[str, float]) -> InstSnap | None:
+        price_ts = base.get("price_ts") or time.time()
         async with self._sem:
             try:
                 c15, c1h = await asyncio.gather(self.okx.candles(inst, "15m", 100), self.okx.candles(inst, "1H", 100))
             except OkxError:
                 return None
             fr = await self._funding(spec)
+        c15 = _closed_candles(c15, 900.0, price_ts)
+        c1h = _closed_candles(c1h, 3600.0, price_ts)
         if len(c15) < 20 or len(c1h) < 20:
             return None
         h15, l15, k15 = _parse_candles(c15)
@@ -255,13 +284,14 @@ class Market:
                 ann = basis * 365.0 / days
         return InstSnap(
             inst=inst, last=last, chg24h=base["chg24h"], vol_usd=base["vol_usd"], funding=funding,
-            ret15m=pct_change(last, k15[-2]) if len(k15) > 1 else 0.0,
-            ret1h=pct_change(last, k15[-5]) if len(k15) > 4 else 0.0,
-            ret4h=pct_change(last, k1[-5]) if len(k1) > 4 else 0.0,
+            ret15m=_horizon_return(last, c15, 900.0, price_ts, 900.0),
+            ret1h=_horizon_return(last, c15, 900.0, price_ts, 3600.0),
+            ret4h=_horizon_return(last, c1h, 3600.0, price_ts, 14400.0),
             rsi15=rsi(k15), rsi1h=rsi(k1), ema20=e20, ema50=e50, trend=trend,
             atr1h_pct=(a / last * 100.0) if a else None,
             closes_1h=k1[-24:], min_notional=spec.min_notional(last), max_lever=spec.max_lever,
             category=spec.category, kind=spec.kind, tag=spec.tag, days_left=days, basis=basis, ann_basis=ann,
+            price_ts=price_ts,
         )
 
     async def snapshot(self, insts: list[str], tick: dict[str, dict]) -> dict[str, InstSnap]:
@@ -272,7 +302,8 @@ class Market:
                 index = await self.okx.index_tickers("USDT")
             except OkxError:
                 index = {}
-        results = await asyncio.gather(*(self._one(i, tick[i], self.specs[i], index) for i in insts if i in tick))
+        results = await asyncio.gather(*(self._one(i, {**tick[i], "price_ts": tick[i].get("price_ts") or t0},
+                                                 self.specs[i], index) for i in insts if i in tick))
         snaps = {s.inst: s for s in results if s}
         self.last_snapshot_secs = time.time() - t0
         return snaps

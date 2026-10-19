@@ -37,7 +37,7 @@ class PriceFeed:
             self._resub.set()
 
     def set(self, inst: str, price: float, ts: float | None = None) -> None:
-        now = ts or time.time()
+        now = time.time() if ts is None else ts
         self.prices[inst] = price
         self.ts[inst] = now
         self.updated = max(self.updated, now)
@@ -51,10 +51,12 @@ class PriceFeed:
         """Fetch current prices for these instruments over REST, whatever their market kind."""
         wanted = set(insts)
         for inst_type in sorted({inst_type_of(i) for i in wanted}):
+            started = time.time()
             for row in await self.okx.tickers(inst_type):
                 if row.get("instId") in wanted:
                     try:
-                        self.set(row["instId"], float(row["last"]))
+                        timestamp = float(row.get("ts") or started * 1000.0) / 1000.0
+                        self.set(row["instId"], float(row["last"]), timestamp)
                     except (KeyError, ValueError, TypeError):
                         continue
 
@@ -96,13 +98,15 @@ class PriceFeed:
 
     async def _read(self, ws) -> None:
         async for raw in ws:
+            received = time.time()
             try:
                 msg = json.loads(raw)
             except ValueError:
                 continue
             for row in msg.get("data", []) if isinstance(msg, dict) else []:
                 try:
-                    self.set(row["instId"], float(row["last"]))
+                    timestamp = float(row.get("ts") or received * 1000.0) / 1000.0
+                    self.set(row["instId"], float(row["last"]), timestamp)
                 except (KeyError, ValueError, TypeError):
                     continue
 

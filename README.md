@@ -81,7 +81,7 @@ kill switches every few seconds.
 | Market | What it is | What AEON does with it |
 |---|---|---|
 | **Perpetual** (`SOL-USDT-SWAP`) | USDT-margined swap, no expiry, pays funding | long or short, 1-5x, isolated margin |
-| **Dated future** (`BTC-USD_UM-261030`) | USDⓈ-margined futures that **expire** (this month, next month, quarter) | same as a perpetual, plus: never opened within 3 days of expiry, **closed 1 day before it**, basis and annualised basis shown to the agent |
+| **Dated future** (`BTC-USD_UM-261030`) | USDⓈ-margined futures that **expire** (this month, next month, quarter). **Off by default**: add `"futures"` to `universe.markets` once you have watched a demo day without it | same as a perpetual, plus: never opened within 3 days of expiry, **closed 1 day before it**, basis and annualised basis shown to the agent |
 | **Spot** (`SOL-USDT`) | the coin itself | **long-only**, no leverage, never liquidated. 0.1% fee per side. AEON only ever sells coins it bought itself, so anything you already hold is safe |
 | Margin, options, events | | not built (see below) |
 
@@ -101,18 +101,21 @@ kill switches every few seconds.
 ## The agent is free to decide; the code is not negotiable
 
 The model chooses *what* to do. These limits are enforced **in code after it decides**, so it cannot
-argue past them (all in `config.toml`, rejected or clipped actions are shown to the model next cycle so it learns):
+argue past them (all in `config.toml`, rejected or clipped actions are shown to the model next cycle so it learns). The shipped
+values are deliberately conservative for a ~200 USDT account that has never traded for real; see the comments in
+`config.toml` for what they work out to and for the next step up:
 
 | Rule | Default |
 |---|---|
-| Max leverage | 5x |
-| Max loss if stopped out (size is clipped to fit) | 2% of equity |
-| Stop required on every position, distance | 0.4%-8% from price |
+| Max leverage | 2x |
+| Max loss if stopped out (size is clipped to fit) | 0.5% of equity |
+| Stop required on every position, distance | 1%-8% from price |
 | Stops may only move closer, never further away | on |
-| Margin per position / open positions / total exposure | 35% / 3 / 3x equity |
-| Daily loss limit (then no new positions until 00:00 UTC) | 8% |
-| Drawdown from peak: **flatten everything and halt until you press R** | 25% |
-| Re-entry cooldown on a contract / max entries per day | 30 min / 24 |
+| Margin per position / open positions / total exposure | 30% / 2 / 1.5x equity |
+| Daily loss limit (then no new positions until 00:00 UTC) | 2% |
+| Drawdown from peak: **flatten everything and halt until you press R** (or `--ctl resume --yes`) | 10% |
+| Re-entry cooldown on a contract / max entries per day | 60 min / 10 |
+| Markets traded | perpetuals and spot (dated futures are opt-in) |
 | One position per coin across spot / perp / future | on |
 | Dated futures: no new position within / force-close before expiry | 3 days / 1 day |
 | Spot | long-only, 1x |
@@ -160,8 +163,8 @@ How AEON keeps its books straight on a real account:
      perpetuals; `--check` tells you which mode you are in. The same applies to the demo account.
    * Create an API key for that sub-account with **Trade permission only. Never enable Withdraw.**
      Restrict it to your machine's IP.
-   * Set `mode = "live"` and `AEON_CONFIRM_LIVE=I-ACCEPT-REAL-MONEY-RISK` in `.env`. Without that
-     phrase live mode refuses to start.
+   * Set `AEON_MODE=live` (or `mode = "live"` in `config.toml`) and `AEON_CONFIRM_LIVE=I-ACCEPT-REAL-MONEY-RISK` in
+     `.env`. Without that phrase live mode refuses to start.
 
 Never paste your API keys into chat, a ticket or a commit. `.env` is git-ignored.
 
@@ -189,6 +192,17 @@ docker compose up -d                                  # survives reboots and dis
 `P` pause/resume decisions · `C` think now · `M` read the agent's memory and trade theses ·
 `F` flatten everything (confirm) · `K` kill switch: flatten and halt (confirm) · `R` resume after a halt ·
 `Q` quit (confirm)
+
+**The terminal UI fits the window you give it**, from about 60x18 up, and re-flows live when you resize:
+150+ columns show three columns (watchlist, equity curve and agent stream, risk / executions / LLM meter);
+100-149 show two columns with the risk row underneath; under 100 everything stacks in one column that scrolls
+(mouse wheel, `↑` `↓` `PgUp` `PgDn` `Home`), with what the agent is doing right under the positions. Under 30 rows the
+header and the six KPI tiles each become one line. Tables show as many columns as fit, most important first
+(symbol, last, type, 24h... or symbol, side, P&L, mark, entry...), and the thesis column takes whatever width is left.
+
+On a headless server (no terminal UI) the same actions are a local command against the running daemon:
+`python -m aeon --ctl status|pause|unpause|cycle|flatten|kill|resume` (`--yes` is required for flatten, kill and resume).
+It listens on `127.0.0.1` only and needs a token that only the AEON user can read; see `DOCKER.md` Section 5.
 
 ## Discord alerts
 

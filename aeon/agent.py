@@ -71,6 +71,9 @@ class Agent:
         self._expiry_tried: dict[str, float] = {}
         self._snap_ts = 0.0                              # when the current market snapshot was taken
         self.last_beat = time.time()                     # the monitor loop's last completed pass
+        self.last_successful_monitor = self.last_beat
+        self.monitor_error = ""
+        self._reported_fills: set[str] = set()
         self.on_beat = None                              # optional callback(ts), e.g. write the heartbeat file
 
     # --- account (with the capital cap) --------------------------------------
@@ -82,20 +85,37 @@ class Agent:
         budget = self.cfg.run.budget_usdt
         if self.mode != "paper" and budget > 0:
             equity = budget + (self.stats.get("realized") or 0.0) + acct.upl
+            reserve = self.j.kv_get("capital_reserve")
+            if not reserve or reserve.get("budget") != budget:
+                reserve = {"budget": budget, "amount": max(acct.equity - equity, 0.0)}
+                self.j.kv_set("capital_reserve", reserve)
+            equity = min(equity, acct.equity - reserve["amount"])
             acct.available = max(min(acct.available, equity - acct.margin_used), 0.0)
             acct.equity = equity
         return acct
 
     def _save_broker_state(self) -> None:
-        self.j.kv_set("paper_state" if self.mode == "paper" else "okx_state", self.broker.dump())
+        self.j.save_broker_state("paper_state" if self.mode == "paper" else "okx_state", self.broker.dump())
+
+    def _sync_risk_activity(self) -> None:
+        self.risk.trades_today, closed = self.j.risk_activity()
+        self.risk.last_close.update(closed)
+
+    def _update_risk(self, account: Account) -> None:
+        for message in self.risk.update_equity(account.equity):
+            self.emit("risk", message)
+        self._sync_risk_activity()
+        self.risk_status = self.risk.status(account)
+        self._refresh_status()
 
     def _price(self, inst: str) -> tuple[float, float]:
         """The freshest price we have for an instrument and its age in seconds: the live feed, or the market
         snapshot taken at the start of this cycle, whichever is newer."""
         price, age = self.feed.prices.get(inst, 0.0), self.feed.age(inst)
         snap = self.snaps.get(inst)
-        if snap and self._snap_ts and time.time() - self._snap_ts < age:
-            price, age = snap.last, time.time() - self._snap_ts
+        observed = (getattr(snap, "price_ts", 0.0) or self._snap_ts) if snap else 0.0
+        if snap and observed and time.time() - observed < age:
+            price, age = snap.last, max(time.time() - observed, 0.0)
         return price, age
 
     def _name(self, inst: str) -> str:
@@ -150,6 +170,8 @@ class Agent:
                                     f"{len(state.get('desired', {}))} stop(s) on record")
         if hasattr(self.broker, "on_change"):              # save broker state the moment an order is recorded
             self.broker.on_change = self._save_broker_state
+        for fill in list(getattr(self.broker, "outbox", [])):
+            self._record_fill(fill)
         self.stats = self.j.stats()
         self.llm24 = self.j.llm_usage(time.time() - 86400)
         prices = await self._seed_prices()
@@ -160,6 +182,7 @@ class Agent:
             self.j.kv_set("start_equity", self.start_equity)
         self.thesis = self.j.kv_get("thesis", {}) or {}
         self.risk.update_equity(self.account.equity)
+        self._sync_risk_activity()
         self.risk_status = self.risk.status(self.account)
         self.feed.watch(set(self.account.positions))
         self.equity_hist.append((time.time(), self.account.equity))
@@ -191,7 +214,7 @@ class Agent:
         """Seconds the monitor loop has been silent; infinite if a background task has died."""
         if any(t.done() for t in self._tasks):
             return float("inf")
-        return time.time() - self.last_beat
+        return time.time() - min(self.last_beat, self.last_successful_monitor)
 
     async def stop(self) -> None:
         for t in self._tasks:
@@ -258,33 +281,39 @@ class Agent:
     async def _monitor_loop(self) -> None:
         while True:
             try:
-                await self._monitor_once()
+                successful = await self._monitor_once()
+                if successful is not False:
+                    self.last_successful_monitor = time.time()
+                    self.monitor_error = ""
             except asyncio.CancelledError:
                 raise
             except Exception as e:                       # the monitor must never die
+                self.monitor_error = f"{type(e).__name__}: {e}"
                 self.emit("error", f"monitor: {type(e).__name__}: {e}")
             self._beat()
             await asyncio.sleep(self.cfg.run.monitor_seconds)
 
-    async def _monitor_once(self) -> None:
+    async def _monitor_once(self) -> bool:
         prices = dict(self.feed.prices)
+        protection_error = ""
         async with self.lock:
             fills = await self.broker.tick(prices)
             for note in self.broker.drain_notes():
                 self.emit("risk", note)
-            for f in fills:
+                if "UNPROTECTED" in note or "fail-safe close FAILED" in note:
+                    protection_error = note
+            for f in [*fills, *list(getattr(self.broker, "outbox", []))]:
                 self._record_fill(f)
             try:
                 acct = await self._account(prices)
             except OkxError as e:
+                self.monitor_error = f"account fetch failed: {e.msg}"
                 self.emit("error", f"account fetch failed: {e.msg}")
-                return
+                return False
             self.account = acct
-            self.j.kv_set("paper_state" if self.mode == "paper" else "okx_state", self.broker.dump())
+            self._save_broker_state()
+            self._update_risk(acct)
         await self._expiry_watch(acct)
-        for msg in self.risk.update_equity(acct.equity):
-            self.emit("risk", msg)
-        self.risk_status = self.risk.status(acct)
         now = time.time()
         self.equity_hist.append((now, acct.equity))
         if now - self._last_equity_log > 60:
@@ -298,6 +327,8 @@ class Agent:
             self.emit("risk", "kill switch active: closing all positions")
             await self.flatten(f"kill switch: {self.risk.kill_reason}")
         self._refresh_status()
+        self.monitor_error = getattr(self.broker, "last_error", "") or protection_error
+        return not self.monitor_error
 
     async def _expiry_watch(self, acct: Account) -> None:
         """Dated futures are closed shortly before they expire, never left to settle."""
@@ -368,8 +399,8 @@ class Agent:
             self.emit("risk", f"price feed is stale ({self.feed.transport}); skipping this cycle")
             self.next_cycle_ts = time.time() + 45
             return
-        self.snaps = await self.market.snapshot(universe, tick)
         self._snap_ts = time.time()
+        self.snaps = await self.market.snapshot(universe, tick)
         self.cycle_no += 1
         n = self.cycle_no
         ctx = Context(now=time.time(), mode=self.mode, cycle_no=n, account=acct, status=self.risk.status(acct),
@@ -442,7 +473,10 @@ class Agent:
         async with self.lock:
             try:
                 acct = await self._account()
+                self._update_risk(acct)
                 pos = acct.positions.get(p.inst)
+                if p.type in ("open", "add") and self.monitor_error:
+                    return self._reject(p, cycle_id, f"monitor safety checks are degraded: {self.monitor_error}")
                 extra: dict = {}                    # shown as fields in the Discord fill alert
                 if p.type == "open":
                     if spec.kind == "spot" and not p.side:
@@ -486,7 +520,7 @@ class Agent:
                     fill = await self.broker.close(spec, price, p.reason)
                     self.emit("action", f"CLOSE {self._name(p.inst)} | {p.reason}")
                 elif p.type == "adjust":
-                    v = self.risk.evaluate_adjust(p, pos, price)
+                    v = self.risk.evaluate_adjust(p, pos, price, spec=spec)
                     if not v.ok:
                         return self._reject(p, cycle_id, v.why)
                     v.stop_loss, v.take_profit = self._tick(spec, v.stop_loss), self._tick(spec, v.take_profit)
@@ -510,6 +544,7 @@ class Agent:
             self._record_fill(fill, **extra)
             self.j.add_action(cycle_id, p.type, p.inst, p.__dict__, "done", f"{fill.event} @ {fill.price:g}")
             self.account = await self._account()
+            self._update_risk(self.account)
 
     @staticmethod
     def _tick(spec, price: float | None) -> float | None:
@@ -520,14 +555,19 @@ class Agent:
             self.emit("risk", f"adjusted: {n}")
 
     def _record_fill(self, f: Fill, **extra) -> None:
-        self.j.add_trade(f)
+        self.j.save_broker_state("paper_state" if self.mode == "paper" else "okx_state", self.broker.dump(), [f])
+        execution_id = getattr(f, "execution_id", "")
+        if execution_id and hasattr(self.broker, "ack_fills"):
+            self.broker.ack_fills([execution_id])
+        self.stats = self.j.stats()
+        self._sync_risk_activity()
+        if execution_id and execution_id in self._reported_fills:
+            return
+        if execution_id:
+            self._reported_fills.add(execution_id)
         if f.event == "open" and f.reason and f.inst not in self.thesis:   # e.g. an entry booked by reconciliation
             self.thesis[f.inst] = f.reason
             self.j.kv_set("thesis", self.thesis)
-        if f.event in ("open", "add"):
-            self.risk.on_trade()
-        if f.event == "close":
-            self.risk.on_close(f.inst, f.ts)
         spec = self.market.specs.get(f.inst)
         pnl = f"pnl {f.pnl:+.2f}" + (f" (trade {f.trade_pnl:+.2f})" if f.trade_pnl is not None else "")
         self.emit("fill", f"{f.event.upper():<6} {self._name(f.inst):<8} {f.side:<5} {f.contracts:g} @ {f.price:g} | "

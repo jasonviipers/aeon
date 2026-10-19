@@ -11,6 +11,7 @@ from .broker import Account, Position
 from .config import RiskCfg
 from .journal import Journal
 from .market import Spec, size_contracts
+from .okx import round_step
 
 
 @dataclass
@@ -201,7 +202,8 @@ class RiskEngine:
         if not pos.sl:
             return _reject("position has no stop; adjust the stop first")
         prop = Proposal(**{**prop.__dict__, "side": pos.side,
-                           "stop_loss": prop.stop_loss or pos.sl, "take_profit": prop.take_profit or pos.tp})
+                           "stop_loss": prop.stop_loss if prop.stop_loss is not None else pos.sl,
+                           "take_profit": prop.take_profit if prop.take_profit is not None else pos.tp})
         v = self._size_new(prop, acct, spec, price, existing=pos)
         if v.ok and self.cfg.stops_only_tighten and not self._tighter_or_equal(pos, v.stop_loss):
             return _reject("adding may not loosen the existing stop")
@@ -214,6 +216,10 @@ class RiskEngine:
         sl, tp = prop.stop_loss, prop.take_profit
         if _not_finite(price, sl, tp, prop.margin_pct, prop.leverage) or not price or price <= 0:
             return _reject("a price, stop, target, margin or leverage value is not a usable number")
+        if not math.isfinite(spec.tick_sz) or spec.tick_sz <= 0:
+            return _reject("instrument tick size is not a usable number")
+        sl = round_step(sl, spec.tick_sz) if sl is not None else None
+        tp = round_step(tp, spec.tick_sz) if tp is not None else None
         if not math.isfinite(acct.equity) or acct.equity <= 0:
             return _reject("account equity is unavailable")
         if prop.margin_pct is not None and prop.margin_pct <= 0:
@@ -227,7 +233,7 @@ class RiskEngine:
             return _reject(f"stop is only {d:.2f}% away; minimum is {c.min_stop_pct}% (it would be hit by noise)")
         if d > c.max_stop_pct:
             return _reject(f"stop is {d:.2f}% away; maximum is {c.max_stop_pct}%")
-        if tp and ((long and tp <= price) or (not long and tp >= price)):
+        if tp is not None and (tp <= 0 or (long and tp <= price) or (not long and tp >= price)):
             return _reject(f"take_profit {tp} is on the wrong side of price {price}")
 
         notes: list[str] = []
@@ -270,8 +276,11 @@ class RiskEngine:
             else:
                 return _reject(f"exchange minimum order is ${min_notional:,.2f}, over your risk limits at a {d:.1f}% stop")
         notional = contracts * spec.ct_val * price
+        max_loss = (notional + cur_notional) * loss_per_notional
+        if max_loss > eq * c.risk_per_trade_pct / 100.0 + 1e-9:
+            return _reject("rounded order exceeds the risk-per-trade limit")
         return Verdict(ok=True, notes=notes, contracts=contracts, leverage=lever, notional=notional,
-                       margin=notional / lever, max_loss=(notional + cur_notional) * loss_per_notional,
+                       margin=notional / lever, max_loss=max_loss,
                        stop_loss=sl, take_profit=tp)
 
     def _tighter_or_equal(self, pos: Position, new_sl: float | None) -> bool:
@@ -279,37 +288,51 @@ class RiskEngine:
             return True
         return new_sl >= pos.sl - 1e-12 if pos.side == "long" else new_sl <= pos.sl + 1e-12
 
-    def evaluate_adjust(self, prop: Proposal, pos: Position | None, price: float) -> Verdict:
+    def evaluate_adjust(self, prop: Proposal, pos: Position | None, price: float,
+                        spec: Spec | None = None) -> Verdict:
         c = self.cfg
         if not pos:
             return _reject("no open position to adjust")
         if _not_finite(price, prop.stop_loss, prop.take_profit) or not price or price <= 0:
             return _reject("a price, stop or target value is not a usable number")
         long = pos.side == "long"
-        sl = prop.stop_loss if prop.stop_loss else pos.sl
-        tp = prop.take_profit if prop.take_profit else pos.tp
-        if prop.stop_loss:
+        sl = prop.stop_loss if prop.stop_loss is not None else pos.sl
+        tp = prop.take_profit if prop.take_profit is not None else pos.tp
+        if _not_finite(sl, tp):
+            return _reject("a stop or target value is not a usable number")
+        if spec is not None:
+            if not math.isfinite(spec.tick_sz) or spec.tick_sz <= 0:
+                return _reject("instrument tick size is not a usable number")
+            sl = round_step(sl, spec.tick_sz) if sl is not None else None
+            tp = round_step(tp, spec.tick_sz) if tp is not None else None
+        if sl is not None:
+            if sl <= 0:
+                return _reject("stop_loss must be positive")
             if (long and sl >= price) or (not long and sl <= price):
                 return _reject(f"stop {sl} is on the wrong side of price {price}")
             d = abs(price - sl) / price * 100.0
             if d < c.min_stop_pct:
                 return _reject(f"stop is only {d:.2f}% from price; minimum is {c.min_stop_pct}%")
-            if d > c.max_stop_pct and pos.sl is None:
-                return _reject(f"stop is {d:.2f}% from price; maximum is {c.max_stop_pct}%")
             if c.stops_only_tighten and not self._tighter_or_equal(pos, sl):
                 return _reject(f"stops may only move closer ({pos.sl} -> {sl} would loosen it)")
-        if prop.take_profit and ((long and tp <= price) or (not long and tp >= price)):
+            if d > c.max_stop_pct:
+                return _reject(f"stop is {d:.2f}% from price; maximum is {c.max_stop_pct}%")
+        if tp is not None and (tp <= 0 or (long and tp <= price) or (not long and tp >= price)):
             return _reject(f"take_profit {tp} is on the wrong side of price {price}")
         if sl is None:
             return _reject("a position must always carry a stop")
-        return Verdict(ok=True, stop_loss=sl, take_profit=tp)
+        fee = c.spot_fee_rate if pos.kind == "spot" else c.fee_rate
+        max_loss = pos.contracts * pos.ct_val * (abs(price - sl) + 2.0 * fee * price)
+        return Verdict(ok=True, stop_loss=sl, take_profit=tp, max_loss=max_loss)
 
     def evaluate_reduce(self, prop: Proposal, pos: Position | None, spec: Spec) -> Verdict:
         if not pos:
             return _reject("no open position to reduce")
         if _not_finite(prop.pct):
             return _reject("pct is not a usable number")
-        pct = min(max(prop.pct or 50.0, 1.0), 100.0)
+        if prop.pct is not None and not 0 < prop.pct <= 100:
+            return _reject("pct must be greater than zero and at most 100")
+        pct = prop.pct if prop.pct is not None else 50.0
         if pct >= 99.0:
             return Verdict(ok=True, contracts=pos.contracts, notes=["treated as a full close"])
         contracts = size_contracts(pos.contracts * pct / 100.0 * pos.ct_val * (pos.mark or pos.entry),
